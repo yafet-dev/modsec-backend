@@ -1,6 +1,8 @@
+// Load .env before any other imports so SUPABASE_* etc. are available when modules load
+import "dotenv/config";
+
 import express, { Express, Request, Response } from "express";
 import cors from "cors";
-import dotenv from "dotenv";
 import swaggerJsdoc from "swagger-jsdoc";
 import swaggerUi from "swagger-ui-express";
 import { userRoutes } from "./routes/user.routes";
@@ -16,9 +18,6 @@ import { geoAccessRoutes } from "./routes/geo-access.routes";
 import { notificationSettingsRoutes } from "./routes/notification-settings.routes";
 import { telegramWebhookRouter, telegramApiRouter } from "./routes/telegram.routes";
 import { modsecCronScheduler } from "./services/modsecCronScheduler";
-
-// Load environment variables
-dotenv.config();
 
 const app: Express = express();
 const PORT = process.env.PORT || 3001;
