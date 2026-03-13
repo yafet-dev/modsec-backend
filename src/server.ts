@@ -11,6 +11,10 @@ import { organizationMembersRoutes } from "./routes/organization-members.routes"
 import { modsecRoutes } from "./routes/modsec.routes";
 import { logsRoutes } from "./routes/logs.routes";
 import { domainWafRoutes } from "./routes/domain-waf.routes";
+import { ipBanRoutes, publicIPBanRouter } from "./routes/ip-ban.routes";
+import { geoAccessRoutes } from "./routes/geo-access.routes";
+import { notificationSettingsRoutes } from "./routes/notification-settings.routes";
+import { telegramWebhookRouter, telegramApiRouter } from "./routes/telegram.routes";
 import { modsecCronScheduler } from "./services/modsecCronScheduler";
 
 // Load environment variables
@@ -173,6 +177,139 @@ const swaggerOptions = {
             },
           },
         },
+        GeoAccessControl: {
+          type: "object",
+          properties: {
+            id: {
+              type: "string",
+              format: "uuid",
+              description: "Geo access control unique identifier",
+            },
+            organizationId: {
+              type: "string",
+              format: "uuid",
+              description: "Organization ID",
+            },
+            domain: {
+              type: "string",
+              description: "Domain name or '*' for all domains",
+            },
+            mode: {
+              type: "string",
+              enum: ["allow-all", "allow-only", "ban-specific"],
+              description: "Filter mode: allow-all (no restrictions), allow-only (only selected countries), ban-specific (block selected countries)",
+            },
+            allowedCountries: {
+              type: "array",
+              items: {
+                type: "string",
+              },
+              description: "ISO-3166-1 alpha-2 country codes for allow list",
+            },
+            deniedCountries: {
+              type: "array",
+              items: {
+                type: "string",
+              },
+              description: "ISO-3166-1 alpha-2 country codes for deny list",
+            },
+            createdAt: {
+              type: "string",
+              format: "date-time",
+              description: "Creation timestamp",
+            },
+            updatedAt: {
+              type: "string",
+              format: "date-time",
+              description: "Last update timestamp",
+            },
+          },
+          required: [
+            "id",
+            "organizationId",
+            "domain",
+            "mode",
+            "allowedCountries",
+            "deniedCountries",
+            "createdAt",
+            "updatedAt",
+          ],
+        },
+        NotificationSettings: {
+          type: "object",
+          properties: {
+            id: {
+              type: "string",
+              format: "uuid",
+              description: "Notification settings unique identifier",
+            },
+            organizationId: {
+              type: "string",
+              format: "uuid",
+              description: "Organization ID",
+            },
+            notificationType: {
+              type: "string",
+              enum: ["email", "telegram"],
+              description: "Notification channel type",
+            },
+            emailList: {
+              type: "array",
+              items: {
+                type: "string",
+              },
+              description: "Array of email addresses (for email notifications)",
+            },
+            telegramChatId: {
+              type: "string",
+              nullable: true,
+              description: "Telegram chat ID (for telegram notifications)",
+            },
+            domainFilter: {
+              type: "string",
+              enum: ["all", "specific"],
+              description: "Domain filter type",
+            },
+            selectedDomains: {
+              type: "array",
+              items: {
+                type: "string",
+              },
+              description: "Array of selected domains (if domainFilter is 'specific')",
+            },
+            severityFilter: {
+              type: "string",
+              enum: ["all", "critical", "high", "low"],
+              description: "Severity level filter",
+            },
+            enabled: {
+              type: "boolean",
+              description: "Whether notifications are enabled",
+            },
+            createdAt: {
+              type: "string",
+              format: "date-time",
+              description: "Creation timestamp",
+            },
+            updatedAt: {
+              type: "string",
+              format: "date-time",
+              description: "Last update timestamp",
+            },
+          },
+          required: [
+            "id",
+            "organizationId",
+            "notificationType",
+            "emailList",
+            "domainFilter",
+            "selectedDomains",
+            "severityFilter",
+            "enabled",
+            "createdAt",
+            "updatedAt",
+          ],
+        },
       },
     },
   },
@@ -220,11 +357,21 @@ app.get("/health", (req: Request, res: Response) => {
   });
 });
 
+// Telegram webhook (must be before CORS/auth middleware in the chain; no auth required)
+app.use("/telegram", telegramWebhookRouter);
+
+// Public IP ban endpoint (no auth required)
+app.use("/api/ip-bans", publicIPBanRouter);
+
 // API Routes
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/organizations", organizationRoutes);
 app.use("/api/organizations", domainWafRoutes);
+app.use("/api/organizations", ipBanRoutes);
+app.use("/api/organizations", geoAccessRoutes);
+app.use("/api/organizations", notificationSettingsRoutes);
+app.use("/api/telegram", telegramApiRouter);
 app.use("/api/invitations", invitationRoutes);
 app.use("/api/organization-members", organizationMembersRoutes);
 app.use("/api/modsec", modsecRoutes);

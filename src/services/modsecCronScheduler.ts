@@ -1,5 +1,6 @@
-import cron from "node-cron";
+import * as cron from "node-cron";
 import { processAllModsecLandingRecords } from "./modsecProcessor";
+import { sendNotificationsForLogs, sendNotificationsForNewLogs } from "./notificationService";
 
 /**
  * Cron scheduler for processing ModSec landing records
@@ -81,6 +82,30 @@ class ModsecCronScheduler {
           console.log(`   ⚠️  ${result.errors.length} errors (too many to display)`);
         }
 
+        // Phase 2: Send notifications for newly processed logs
+        if (result.processed > 0) {
+          console.log(`\n   📧 Starting notification phase...`);
+          try {
+            if (result.logIds && result.logIds.length > 0) {
+              console.log(`   📧 Sending notifications for ${result.logIds.length} newly created log(s)...`);
+              const notificationResult = await sendNotificationsForLogs(result.logIds);
+              console.log(`   📧 Notifications sent: ${notificationResult.sent}, failed: ${notificationResult.failed}`);
+              if (notificationResult.errors.length > 0) {
+                notificationResult.errors.forEach((err) => {
+                  console.log(`      ⚠️  Log ${err.logId}: ${err.error}`);
+                });
+              }
+            } else {
+              console.log(`   📧 No log IDs returned, using fallback timestamp method...`);
+              const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
+              const notificationResult = await sendNotificationsForNewLogs(tenMinutesAgo);
+              console.log(`   📧 Notifications sent: ${notificationResult.sent}, failed: ${notificationResult.failed}`);
+            }
+          } catch (notifError) {
+            console.error(`   ❌ Notification error:`, notifError);
+          }
+        }
+
         console.log(`✅ [${new Date().toISOString()}] Cron job completed`);
       } catch (error) {
         const duration = Date.now() - startTime;
@@ -89,7 +114,6 @@ class ModsecCronScheduler {
         this.isRunning = false;
       }
     }, {
-      scheduled: true,
       timezone: "UTC"
     });
 

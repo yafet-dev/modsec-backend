@@ -1,4 +1,5 @@
 import { prisma } from "../lib/prisma";
+import { enrichSeverity } from "./severityEnrichment";
 
 /**
  * Sanitize string fields to prevent Unicode escape sequence issues
@@ -19,7 +20,7 @@ function sanitizeString(str: any): string | null {
     .replace(/\0/g, '') // Remove actual null bytes
     .replace(/\\u0000/g, '') // Remove \u0000 escape sequences
     .replace(/\\u0000/gi, '') // Case-insensitive removal
-    .replace(/\\u([0-9a-fA-F]{4})/g, (match, hex) => {
+    .replace(/\\u([0-9a-fA-F]{4})/g, (match: string, hex: string) => {
       // Convert valid Unicode escapes to actual characters, but skip null
       try {
         const code = parseInt(hex, 16);
@@ -261,18 +262,20 @@ export function transformModsecToLog(
     transaction.request.headers?.["user-agent"] ||
     null;
 
-  // Determine action
+  // Enrich severity from anomaly score + attack tags (not raw ModSec severity)
+  const enrichment = enrichSeverity(transaction.messages);
+  const severity = enrichment.severity_normalized;
+
+  // Determine action (still uses response code, but severity-based fallback now uses enriched severity)
   const action = determineAction(
     transaction.response?.http_code,
-    details?.severity
+    enrichment.severity_normalized === "CRITICAL" ? "8" :
+    enrichment.severity_normalized === "HIGH" ? "6" :
+    enrichment.severity_normalized === "MEDIUM" ? "4" : "2"
   );
-
-  // Map severity
-  const severity = mapSeverity(details?.severity);
 
   // Parse timestamp
   const timestamp = parseTimestamp(transaction.time_stamp);
-
 
   // Build log entry with sanitized strings
   const logEntry = {
@@ -289,7 +292,11 @@ export function transformModsecToLog(
     ruleId: sanitizeString(details?.ruleId),
     userAgent: sanitizeString(userAgent),
     headers: sanitizeJson(transaction.request.headers),
-    message: sanitizeString(firstMessage?.message),
+    message: sanitizeString(
+      firstMessage?.message
+        ? `${firstMessage.message} [severity: ${enrichment.reason}]`
+        : enrichment.reason
+    ),
     httpMethod: transaction.request.http_version || null,
     // CRITICAL: responseHeader often contains \u0000 in Server header - must sanitize
     responseHeader: transaction.response?.headers 
@@ -422,9 +429,10 @@ export async function processModsecLandingRecord(
 
     // Find organization by matching host against domains array
     // Use provided organizationId if available, otherwise lookup by host
-    let finalOrganizationId = organizationId;
+    let finalOrganizationId: string | undefined = organizationId;
     if (!finalOrganizationId && host && host !== 'unknown') {
-      finalOrganizationId = await findOrganizationByHost(host);
+      const foundOrgId = await findOrganizationByHost(host);
+      finalOrganizationId = foundOrgId || undefined;
     }
 
     // Transform to Log format using sanitized data and found organization ID
@@ -510,8 +518,10 @@ export async function processAllModsecLandingRecords(
   processed: number;
   failed: number;
   errors: Array<{ id: string; error: string }>;
+  logIds: string[]; // Return log IDs that were created
 }> {
   const errors: Array<{ id: string; error: string }> = [];
+  const logIds: string[] = [];
   let processed = 0;
   let failed = 0;
 
@@ -542,6 +552,9 @@ export async function processAllModsecLandingRecords(
 
         if (result.success) {
           processed++;
+          if (result.logId) {
+            logIds.push(result.logId);
+          }
         } else {
           failed++;
           errors.push({ id: record.id.toString(), error: result.error || "Unknown error" });
@@ -552,7 +565,7 @@ export async function processAllModsecLandingRecords(
       hasMore = records.length === batchSize;
     }
 
-    return { processed, failed, errors };
+    return { processed, failed, errors, logIds };
   } catch (error) {
     console.error("Error processing modsec_landing records:", error);
     throw error;

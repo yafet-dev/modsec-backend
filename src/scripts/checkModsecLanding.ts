@@ -17,11 +17,11 @@ async function main() {
     // Get a sample record if any exist
     if (count > 0) {
       const sample = await prisma.modsecLanding.findFirst({
-        orderBy: { date: "desc" },
+        orderBy: { time: "desc" },
       });
       console.log("\n📝 Sample record:");
       console.log(`   ID: ${sample?.id}`);
-      console.log(`   Date: ${sample?.date}`);
+      console.log(`   Time: ${sample?.time}`);
       console.log(`   Processed: ${sample?.processed}`);
       console.log(`   Has data: ${sample?.data ? "Yes" : "No"}`);
     }

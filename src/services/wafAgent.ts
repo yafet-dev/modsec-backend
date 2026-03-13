@@ -116,7 +116,7 @@ class WAFAgentService {
       const signature = sign.sign({
         key: this.privateKeyObject,
         padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
-        saltLength: crypto.constants.RSA_PSS_SALT_LENGTH_MAX,
+        saltLength: crypto.constants.RSA_PSS_SALTLEN_MAX_SIGN,
       });
 
       return signature.toString("base64");
@@ -171,7 +171,7 @@ class WAFAgentService {
         );
       }
 
-      const result: ToggleWAFResponse = await response.json();
+      const result = await response.json() as ToggleWAFResponse;
 
       if (result.status !== "OK") {
         throw new Error(
@@ -203,6 +203,81 @@ class WAFAgentService {
       return response.ok;
     } catch (error) {
       return false;
+    }
+  }
+
+  /**
+   * Ban or unban an IP address for domains
+   */
+  async banIP(
+    ip: string,
+    domains: string[],
+    action: "ban" | "unban"
+  ): Promise<{ ok: boolean; results: Array<{ domain: string; changed: boolean; message: string }> }> {
+    try {
+      const response = await fetch(`${this.config.url}/ban`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.config.authToken}`,
+        },
+        body: JSON.stringify({
+          ip,
+          domains,
+          action,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorBody = await response.text();
+        throw new Error(
+          `WAF Agent returned ${response.status}: ${errorBody || response.statusText}`
+        );
+      }
+
+      const result = await response.json() as { ok: boolean; results: Array<{ domain: string; changed: boolean; message: string }> };
+      return result;
+    } catch (error) {
+      if (error instanceof Error) {
+        throw error;
+      }
+      throw new Error(
+        `Failed to communicate with WAF agent: ${error instanceof Error ? error.message : "Unknown error"}`
+      );
+    }
+  }
+
+  /**
+   * Get IP ban status from agent
+   */
+  async getIPBanStatus(): Promise<{
+    domains: Array<{ domain: string; blocked_ips: string[]; blocked_count: number }>;
+    total_blocked_ips: number;
+  }> {
+    try {
+      const response = await fetch(`${this.config.url}/status`, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${this.config.authToken}`,
+        },
+      });
+
+      if (!response.ok) {
+        const errorBody = await response.text();
+        throw new Error(
+          `WAF Agent returned ${response.status}: ${errorBody || response.statusText}`
+        );
+      }
+
+      const result = await response.json() as { domains: Array<{ domain: string; blocked_ips: string[]; blocked_count: number }>; total_blocked_ips: number };
+      return result;
+    } catch (error) {
+      if (error instanceof Error) {
+        throw error;
+      }
+      throw new Error(
+        `Failed to communicate with WAF agent: ${error instanceof Error ? error.message : "Unknown error"}`
+      );
     }
   }
 }

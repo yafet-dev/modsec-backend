@@ -46,6 +46,9 @@ model Organization {
   logs       Log[]
   members    OrganizationMember[]
   domainWafStatuses DomainWAFStatus[]
+  ipBans     IPBan[]
+  geoAccessControls GeoAccessControl[]
+  notificationSettings NotificationSettings[]
 }
 
 model Log {
@@ -103,4 +106,89 @@ model ModsecLanding {
   @@index([processed])
   @@index([time])
   @@index([tag])
+}
+
+model IPBan {
+  id             String       @id @default(uuid())
+  organizationId String
+  ip             String
+  domains        String[]     // Array of domains, or ["*"] for all domains
+  country        String?      // ISO country code (e.g., "US", "GB")
+  countryName    String?      // Full country name
+  reason         String?      // Reason for ban
+  bannedAt       DateTime     @default(now())
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, ip])
+  @@index([organizationId])
+  @@index([ip])
+  @@index([bannedAt])
+}
+
+model IPBanToken {
+  id             String    @id @default(uuid())
+  organizationId String
+  ip             String
+  domains        String[]  // Array of domains to ban
+  token          String    @unique // Temporary token for one-time use
+  expiresAt      DateTime
+  usedAt        DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@index([token])
+  @@index([organizationId])
+  @@index([expiresAt])
+}
+
+model GeoAccessControl {
+  id             String       @id @default(uuid())
+  organizationId String
+  domain         String       // Domain name or "*" for all domains
+  mode           String       @default("allow-all") // "allow-all" | "allow-only" | "ban-specific"
+  allowedCountries String[]   @default([]) // ISO-3166-1 alpha-2 country codes
+  deniedCountries  String[]   @default([]) // ISO-3166-1 alpha-2 country codes
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, domain])
+  @@index([organizationId])
+  @@index([domain])
+}
+
+model NotificationSettings {
+  id                   String       @id @default(uuid())
+  organizationId       String
+  notificationType     String       // "email" | "telegram"
+  emailList            String[]     @default([]) // Array of email addresses
+  telegramChatId       String?      // Telegram chat ID
+  telegramUserId       String?      // Telegram user ID
+  telegramEnabled      Boolean      @default(false) // Whether telegram is linked and active
+  telegramConnectedAt  DateTime?    // When telegram was connected
+  domainFilter         String       @default("all") // "all" | "specific"
+  selectedDomains      String[]     @default([]) // Array of domain names (empty if domainFilter is "all")
+  severityFilter       String       @default("all") // "all" | "critical" | "high" | "low"
+  enabled              Boolean      @default(true) // Whether notifications are enabled
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+  organization         Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@index([notificationType])
+  @@index([enabled])
+}
+
+model TelegramConnectRequest {
+  id             String    @id @default(uuid())
+  userId         String    // User who initiated the connect
+  organizationId String    // Which org to connect Telegram for
+  connectCode    String    @unique // e.g. "EAG-482193"
+  expiresAt      DateTime
+  usedAt         DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@index([connectCode])
+  @@index([userId])
 }

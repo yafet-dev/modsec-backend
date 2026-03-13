@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../lib/prisma';
 import { supabase } from '../lib/supabase';
+import crypto from 'crypto';
 
 const router = Router();
 
@@ -287,6 +288,7 @@ router.post('/', async (req: Request, res: Response) => {
 
     const user = await prisma.user.create({
       data: {
+        id: crypto.randomUUID(),
         email,
         fullName: fullName || null,
         role: role === 'super_admin' ? 'super_admin' : null,
