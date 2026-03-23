@@ -81,6 +81,75 @@ class EmailService {
   }
 
   /**
+   * Send HTML email with optional inline image (CID), e.g. logo in summary reports.
+   */
+  async sendEmailWithInlineImage(options: {
+    to: string | string[];
+    subject: string;
+    html: string;
+    text?: string;
+    inlineImage?: { path: string; cid: string; filename?: string };
+  }): Promise<{ success: boolean; error?: string }> {
+    if (!this.transporter) {
+      return {
+        success: false,
+        error: "Email service not configured",
+      };
+    }
+
+    const fromEmail = process.env.EMAIL_FROM || process.env.SMTP_USER || "noreply@zergaw.com";
+    const fs = await import("fs/promises");
+
+    try {
+      const recipients = Array.isArray(options.to) ? options.to : [options.to];
+      const attachments: Array<{
+        filename: string;
+        cid: string;
+        content: Buffer;
+      }> = [];
+
+      if (options.inlineImage) {
+        let buf: Buffer;
+        try {
+          buf = await fs.readFile(options.inlineImage.path);
+        } catch {
+          console.warn(
+            `[email] Inline image not found: ${options.inlineImage.path}, sending without logo`
+          );
+          return this.sendEmail({
+            to: recipients,
+            subject: options.subject,
+            html: options.html,
+            text: options.text,
+          });
+        }
+        attachments.push({
+          filename: options.inlineImage.filename || "logo.png",
+          content: buf,
+          cid: options.inlineImage.cid,
+        });
+      }
+
+      await this.transporter.sendMail({
+        from: `Zergaw Cloud Firewall <${fromEmail}>`,
+        to: recipients,
+        subject: options.subject,
+        html: options.html,
+        text: options.text || this.htmlToText(options.html),
+        attachments: attachments.length ? attachments : undefined,
+      });
+
+      return { success: true };
+    } catch (error) {
+      console.error("Error sending email with inline image:", error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : "Unknown error",
+      };
+    }
+  }
+
+  /**
    * Convert HTML to plain text (simple version)
    */
   private htmlToText(html: string): string {

@@ -41,6 +41,10 @@ model Organization {
   domains    String[]
   ownerEmail String?
   status     String               @default("pending")
+  /// Periodic WAF summary emails: daily | weekly | monthly | hourly
+  summaryReportFrequency String   @default("daily")
+  summaryReportEnabled   Boolean  @default(false)
+  summaryReportEmails    String[] @default([])
   createdAt  DateTime             @default(now())
   updatedAt  DateTime             @updatedAt
   logs       Log[]
