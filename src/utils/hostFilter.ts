@@ -1,11 +1,22 @@
 /**
  * Host filtering for logs.
  *
- * A host filter must match the host itself and its subdomains, and nothing
- * else. This was previously a Prisma `contains`, which is a plain substring
- * test, so selecting "gnzabe.com" also matched "notgnzabe.com" and
- * "gnzabe.com.attacker.net", and a short domain like "a.co" matched almost
- * every host. That is why the filter appeared to do nothing.
+ * Selecting a host shows logs for THAT host and nothing else.
+ * apidev.gnzabe.com and apiprod.gnzabe.com are separate options and never
+ * appear in each other's results.
+ *
+ * Two earlier behaviours were both wrong:
+ *
+ *   - Prisma `contains`, a plain substring test, so "gnzabe.com" matched
+ *     notgnzabe.com and gnzabe.com.attacker.net, and "a.co" matched
+ *     banana.com.
+ *   - exact-or-subdomain, so picking the apex still returned every subdomain
+ *     beneath it, which is indistinguishable from no filter when all traffic
+ *     lives on subdomains.
+ *
+ * The host selector is populated from hosts that actually appear in the logs,
+ * so every option corresponds to real rows and exact matching cannot produce a
+ * surprising empty result.
  */
 
 /** Lowercase, trim, and drop a trailing root dot. */
@@ -14,23 +25,17 @@ function canonicalHost(value: string): string {
 }
 
 /**
- * Prisma condition selecting a host and its subdomains.
+ * Prisma condition selecting exactly one host.
  *
- *   "gnzabe.com"         -> gnzabe.com, apiprod.gnzabe.com, a.b.gnzabe.com
- *   "apiprod.gnzabe.com" -> apiprod.gnzabe.com and its own subdomains only
- *
- * Returned as an `OR` group so callers can place it inside an `AND` array
- * alongside other filters; assigning it to `where.OR` directly would collide
- * with the search filter and silently drop one of them.
+ * Returned as an `OR` group of one so callers can place it inside an `AND`
+ * array alongside other filters; assigning to `where.OR` directly would
+ * collide with the search filter and silently drop one of them.
  */
 export function buildHostCondition(hostFilter: string) {
   const host = canonicalHost(hostFilter);
 
   return {
-    OR: [
-      { host: { equals: host, mode: "insensitive" as const } },
-      { host: { endsWith: `.${host}`, mode: "insensitive" as const } },
-    ],
+    OR: [{ host: { equals: host, mode: "insensitive" as const } }],
   };
 }
 
@@ -38,10 +43,9 @@ export function buildHostCondition(hostFilter: string) {
  * The same rule in plain JavaScript, for tests and any in-memory filtering.
  */
 export function hostMatchesFilter(host: string, hostFilter: string): boolean {
-  const target = canonicalHost(host);
   const filter = canonicalHost(hostFilter);
 
   if (!filter) return true;
 
-  return target === filter || target.endsWith(`.${filter}`);
+  return canonicalHost(host) === filter;
 }
