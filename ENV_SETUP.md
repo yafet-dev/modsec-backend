@@ -109,32 +109,34 @@ ID is used.
 Geo endpoints normally share the WAF agent on port 8080. **Which credentials you
 need depends on where the agent runs.**
 
-### Local agent — no credentials needed
+### Agent on the same machine — no credentials needed
 
-When `WAF_AGENT_URL` resolves to the local machine or a private network, the
-signing key and auth token are optional. Requests never leave the trusted
-network, so the backend calls the agent unauthenticated:
+When `WAF_AGENT_URL` is a loopback address, the signing key and auth token are
+optional. The request never touches a network interface, so the backend calls
+the agent unauthenticated:
 
 ```env
 WAF_AGENT_URL="http://localhost:8080"
 ```
 
-That is all. A URL counts as local when its host is:
+That is all. A URL qualifies when its host is `localhost`, `127.x.x.x`, `::1`,
+`::ffff:127.0.0.1`, or a `.localhost` name.
 
-| Category | Examples |
-| --- | --- |
-| Loopback | `localhost`, `127.0.0.1`, `::1` |
-| Private IPv4 (RFC 1918) | `10.0.0.5`, `172.16.0.1`–`172.31.255.254`, `192.168.1.50` |
-| Link-local | `169.254.x.x`, `fe80::/10` |
-| CGNAT / VPN mesh | `100.64.0.0/10` (this is the range Tailscale uses) |
-| Private IPv6 | `fd00::1` and the rest of `fc00::/7` |
-| Container service name | `waf-agent`, `agent` (single-label, no public TLD) |
-| Private-use domains | `agent.local`, `agent.internal`, `box.home.arpa` |
+The agent enforces the mirror image of this rule — it trusts a caller only when
+the peer address is loopback (`is_trusted_local_request` in the waf-agent repo's
+`src/security.py`). **The two definitions must stay in lockstep.** If this side
+ever widened to, say, `10.x`, the agent would answer `403` and you would face a
+backend logging "local, no credentials needed" against an agent demanding them.
 
-### Remote agent — key and token required
+### Agent anywhere else — key and token required
 
-When `WAF_AGENT_URL` is a public IP or public domain, both credentials are
-required and calls fail fast with an explicit error if either is missing:
+Everything that is not loopback needs both credentials, **including private/LAN
+addresses**. `10.0.0.5`, `192.168.1.50`, a Docker service name, and a public
+domain are all treated the same way. A LAN is not automatically trustworthy: the
+agent can disable your firewall, so "anyone on the subnet" is too wide a blast
+radius to grant silently.
+
+Calls fail fast with an explicit error if either credential is missing:
 
 ```env
 WAF_AGENT_URL="http://196.188.250.141:8080"
@@ -151,14 +153,18 @@ just keeps requests authenticated. The rule only governs what is *required*.
 
 ### There is no bypass flag
 
-Deliberately. An agent reached over WireGuard, Tailscale, or an SSH forward is
-addressed by its private endpoint — `10.x`, `100.64.x`, or `localhost:PORT` —
-so a tunnelled agent already classifies as local and needs no override. The only
-thing a bypass could enable is an unauthenticated public agent, which is exactly
-what this rule exists to prevent.
+Deliberately. An agent reached over an SSH forward is addressed as
+`localhost:PORT` and already qualifies. Anything else genuinely crosses a
+network, and the only thing a bypass could enable is an unauthenticated agent
+that can turn off your WAF.
 
 If a remote agent is being refused, you have two real options: supply the
-credentials, or point `WAF_AGENT_URL` at the agent's private address.
+credentials, or run the agent on the same host and address it over loopback.
+
+On the agent side there is one flag, `WAF_AGENT_STRICT_AUTH=true`, which forces
+credentials even for loopback callers. It only ever tightens the policy — set it
+when the agent sits behind a reverse proxy, so a proxied request cannot
+masquerade as local.
 
 ### Geo overrides
 

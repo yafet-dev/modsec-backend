@@ -98,31 +98,45 @@ function serviceWith(overrides: Record<string, string | undefined>) {
   }
 }
 
-test("loopback and private addresses are classified as local", () => {
+test("only loopback addresses are classified as local", () => {
   const localUrls = [
     "http://localhost:8080",
     "https://LOCALHOST:8080",
     "http://127.0.0.1:8080",
     "http://127.1.2.3:8080",
     "http://[::1]:8080",
-    "http://0.0.0.0:8080",
+    "http://[::ffff:127.0.0.1]:8080",
+    "http://agent.localhost:8080",
+  ];
+
+  for (const url of localUrls) {
+    assert.equal(isLocal(url), true, `${url} should be local`);
+  }
+});
+
+/**
+ * The agent trusts only loopback callers (waf-agent src/security.py
+ * is_trusted_local_request). These two lists must stay in lockstep with that
+ * rule: anything this side called "local" that the agent would not is a 403
+ * waiting to happen.
+ */
+test("private network addresses require credentials, matching the agent", () => {
+  const remoteUrls = [
     "http://10.0.5.20:8080",
     "http://172.16.0.1:8080",
-    "http://172.31.255.254:8080",
     "http://192.168.1.50:8080",
     "http://169.254.10.10:8080",
     "http://100.64.0.1:8080", // Tailscale / CGNAT
     "http://[fd00::1]:8080", // IPv6 unique local
     "http://[fe80::1]:8080", // IPv6 link-local
-    "http://[::ffff:127.0.0.1]:8080",
     "http://waf-agent:8080", // Docker Compose service name
     "http://agent.local:8080",
     "http://agent.internal:8080",
-    "http://box.home.arpa:8080",
+    "http://0.0.0.0:8080", // unspecified, not loopback
   ];
 
-  for (const url of localUrls) {
-    assert.equal(isLocal(url), true, `${url} should be local`);
+  for (const url of remoteUrls) {
+    assert.equal(isLocal(url), false, `${url} should require credentials`);
   }
 });
 
@@ -132,10 +146,6 @@ test("public addresses and domains are classified as remote", () => {
     "http://8.8.8.8:8080",
     "https://waf.example.com",
     "https://example.com:8080",
-    "http://172.15.0.1:8080", // just below the 172.16/12 block
-    "http://172.32.0.1:8080", // just above the 172.16/12 block
-    "http://100.63.0.1:8080", // just below CGNAT
-    "http://100.128.0.1:8080", // just above CGNAT
     "http://11.0.0.1:8080",
     "http://[2001:4860:4860::8888]:8080",
   ];

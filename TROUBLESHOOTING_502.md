@@ -36,8 +36,8 @@ journalctl -u your-backend-service -f
 reads `... is remote (...), so WAF_AGENT_PRIVATE_KEY and WAF_AGENT_AUTH_TOKEN
 must be set in .env`
 
-**Cause:** `WAF_AGENT_URL` points at a public IP or domain. Credentials are only
-optional when the agent runs on localhost or a private network address.
+**Cause:** `WAF_AGENT_URL` is not a loopback address. Credentials are only
+optional when the agent runs on the same machine as the backend.
 
 **Solutions**, pick whichever matches your deployment:
 
@@ -50,16 +50,28 @@ optional when the agent runs on localhost or a private network address.
    -----END PRIVATE KEY-----"
    ```
 
-2. **The agent is actually on this machine, your LAN, or behind a tunnel** —
-   point the URL at its private address, and no credentials are needed:
+2. **The agent is actually on this machine** (or reachable via an SSH forward) —
+   address it over loopback and no credentials are needed:
 
    ```env
-   WAF_AGENT_URL="http://localhost:8080"     # same host / SSH forward
-   WAF_AGENT_URL="http://10.8.0.3:8080"      # LAN or WireGuard peer
-   WAF_AGENT_URL="http://100.101.102.103:8080"  # Tailscale
+   WAF_AGENT_URL="http://localhost:8080"
    ```
 
-There is no third option — no environment flag marks a public URL as trusted.
+There is no third option — no environment flag marks a non-loopback URL as
+trusted. Note that a LAN address such as `10.0.0.5` still requires credentials;
+only loopback is exempt.
+
+### Issue: Agent returns 403 for a local-looking setup
+
+**Symptom:** The backend logs 🔓 "is local ... credentials optional", but the
+agent answers `403 Not authenticated`.
+
+**Cause:** The agent is behind a reverse proxy, or `WAF_AGENT_STRICT_AUTH` is
+set on the agent. Both make the agent demand credentials the backend is not
+sending.
+
+**Solution:** Either set `WAF_AGENT_AUTH_TOKEN` and `WAF_AGENT_PRIVATE_KEY` on
+the backend, or remove the proxy hop so the agent sees the real loopback peer.
 
 **Note:** The server always starts; only the agent calls fail. Check the startup
 log line beginning with 🔒, 🔓, or ⚠️ to see which mode is active.

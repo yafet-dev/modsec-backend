@@ -9,29 +9,31 @@ This guide explains how to configure the backend to communicate with the WAF age
 
 | `WAF_AGENT_URL` points at | Signing key | Auth token |
 | --- | --- | --- |
-| Local / private network | Optional | Optional |
-| Public IP or public domain | **Required** | **Required** |
+| Loopback — the same machine | Optional | Optional |
+| Anything else, private LAN included | **Required** | **Required** |
 
-Signatures and bearer tokens protect requests crossing an untrusted network. If
-the agent is on the same box or the same private LAN, nothing leaves the trusted
-network and the credentials buy nothing — so the backend skips them and talks to
-the agent unauthenticated.
+Signatures and bearer tokens protect requests crossing a network. If the agent
+is on the same box, the request never touches a network interface and the
+credentials buy nothing — so the backend skips them and talks to the agent
+unauthenticated.
 
-A URL counts as local when the host is loopback (`localhost`, `127.0.0.1`,
-`::1`), an RFC 1918 address (`10.x`, `172.16–31.x`, `192.168.x`), link-local
-(`169.254.x`, `fe80::/10`), CGNAT/VPN mesh (`100.64.0.0/10`, used by Tailscale),
-IPv6 unique-local (`fc00::/7`), a single-label container service name
-(`waf-agent`), or a private-use domain (`.local`, `.internal`, `.home.arpa`).
+A URL qualifies only when the host is `localhost`, `127.x.x.x`, `::1`,
+`::ffff:127.0.0.1`, or a `.localhost` name.
 
-Anything else — a public IP like `196.188.250.141`, or a domain like
-`waf.example.com` — is remote, and both credentials are mandatory. Calls fail
-immediately with a clear error instead of going out unsigned over the internet.
+Everything else needs both credentials — and that deliberately **includes
+private/LAN addresses** like `10.0.0.5` or a Docker service name, not just
+public hosts like `196.188.250.141`. The agent can disable your firewall, so
+trusting a whole subnet is too wide a blast radius to grant silently.
 
-> Credentials are always **used** when configured, local or not. The rule only
-> governs what is **required**. Set them on a local agent if you want requests
-> authenticated anyway.
+Both sides enforce this. The agent trusts a caller only when its peer address is
+loopback (`is_trusted_local_request` in `src/security.py`), so the backend and
+the agent agree on exactly one credential-free case: both on the same host.
 
-## Local Setup (agent on the same host or LAN)
+> Credentials are always **used** when configured, loopback or not. The rule
+> only governs what is **required**. Set them on a local agent if you want
+> requests authenticated anyway.
+
+## Local Setup (agent on the same host)
 
 One line:
 
@@ -80,23 +82,36 @@ WAF_AGENT_AUTH_TOKEN="a-long-random-token"
 Prefer `https://` for a remote agent. Over plain `http://` the bearer token
 crosses the internet in cleartext, and the backend warns about this at startup.
 
-### Agent behind a tunnel
+### Agent behind an SSH forward
 
-If the agent is reached through WireGuard, Tailscale, or an SSH forward, use the
-tunnel's address rather than the machine's public one:
+An SSH forward is the one tunnel that lands on loopback, so it needs no
+credentials:
+
+```bash
+ssh -L 8080:localhost:8080 user@waf-host
+```
 
 ```env
-# WireGuard peer
-WAF_AGENT_URL="http://10.8.0.3:8080"
-# Tailscale
-WAF_AGENT_URL="http://100.101.102.103:8080"
-# SSH forward: ssh -L 8080:localhost:8080 user@host
 WAF_AGENT_URL="http://localhost:8080"
 ```
 
-All three classify as local, so no credentials are required — the tunnel already
-provides the encryption and authentication that the signature would. There is
-deliberately no flag to mark a *public* URL as trusted.
+WireGuard and Tailscale peers are addressed as `10.x` / `100.64.x`, which are
+*not* loopback — those still require credentials on both sides. There is
+deliberately no flag to mark a non-loopback URL as trusted.
+
+### Agent behind a reverse proxy
+
+If the agent sits behind nginx or similar, every request arrives from the proxy
+and therefore looks like loopback. The agent refuses to treat a request as local
+when it carries `X-Forwarded-For`, `X-Real-IP`, or `Forwarded`, but a proxy that
+strips those would defeat the check. In that setup, set this on the **agent**:
+
+```env
+WAF_AGENT_STRICT_AUTH=true
+```
+
+That forces credentials for every caller, loopback included. It only ever
+tightens the policy.
 
 ## Setting Up the Private Key
 
