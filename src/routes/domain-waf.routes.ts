@@ -2,6 +2,7 @@ import { Router, Request, Response } from "express";
 import { prisma } from "../lib/prisma";
 import { supabase } from "../lib/supabase";
 import { wafAgentService } from "../services/wafAgent";
+import { normalizeDomain } from "../utils/normalizeDomain";
 
 const router = Router();
 
@@ -302,7 +303,7 @@ router.post("/:id/waf-status/toggle", async (req: Request, res: Response) => {
       });
     }
 
-    const normalizedDomain = domain.toLowerCase().trim();
+    const normalizedDomain = normalizeDomain(domain);
 
     // Authorization logic:
     // - super_admin: can toggle any domain (skip organization check)
@@ -544,7 +545,7 @@ router.put("/:id/waf-status", async (req: Request, res: Response) => {
           });
         }
 
-        const normalizedDomain = item.domain.toLowerCase().trim();
+        const normalizedDomain = normalizeDomain(item.domain);
         if (!normalizedOrgDomains.includes(normalizedDomain)) {
           return res.status(403).json({
             message: `Domain ${normalizedDomain} does not belong to your organization`,
@@ -565,7 +566,7 @@ router.put("/:id/waf-status", async (req: Request, res: Response) => {
     // Call WAF agent for each domain first
     const agentErrors: Array<{ domain: string; error: string }> = [];
     for (const item of domains) {
-      const normalizedDomain = item.domain.toLowerCase().trim();
+      const normalizedDomain = normalizeDomain(item.domain);
       try {
         console.log(
           `Calling WAF agent to ${item.enabled ? "enable" : "disable"} WAF for ${normalizedDomain}`
