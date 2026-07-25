@@ -45,6 +45,14 @@ interface GeoAgentStatusResponse {
   mode: string;
   allow: string[];
   deny: string[];
+  /**
+   * Whether an nginx server block for this domain actually includes the rule.
+   * Rule files can exist on disk with no vhost referencing them, in which case
+   * nothing is enforced -- so this is checked rather than assumed.
+   * Optional for compatibility with an agent that predates the field.
+   */
+  enforced?: boolean;
+  enforced_in?: string[];
 }
 
 interface GeoAgentAllStatusResponse {
@@ -357,10 +365,7 @@ class GeoAgentService {
       await clearDeny();
       await clearAllow();
       await this.setMode(target, "deny_only", true);
-      return;
-    }
-
-    if (mode === "allow-only") {
+    } else if (mode === "allow-only") {
       // Lists first, then the mode, so the agent never sits in allow_only with
       // an empty allow list -- which would block every visitor.
       await clearDeny();
@@ -371,10 +376,7 @@ class GeoAgentService {
         (c) => this.removeAllowCountry(target, c, true)
       );
       await this.setMode(target, "allow_only", allowedCountries.length === 0);
-      return;
-    }
-
-    if (mode === "ban-specific") {
+    } else if (mode === "ban-specific") {
       await clearAllow();
       await reconcile(
         currentStatus.deny,
@@ -383,10 +385,35 @@ class GeoAgentService {
         (c) => this.removeDenyCountry(target, c)
       );
       await this.setMode(target, "deny_only", true);
-      return;
+    } else {
+      throw new Error(`Unknown geo access mode: ${mode}`);
     }
 
-    throw new Error(`Unknown geo access mode: ${mode}`);
+    await this.assertEnforced(target);
+  }
+
+  /**
+   * Confirm nginx is actually enforcing the rules before we call this a
+   * success.
+   *
+   * The agent already refuses when it cannot find a server block, but this
+   * verifies the end state rather than trusting the sequence of writes. It is
+   * the difference between "we wrote some files" and "the control is live" --
+   * a distinction that previously cost a silently-unprotected domain.
+   */
+  private async assertEnforced(domain: string): Promise<void> {
+    const status = await this.getStatus(domain);
+
+    // An older agent does not report the field; nothing to verify against.
+    if (status.enforced === undefined) return;
+
+    if (!status.enforced) {
+      throw new Error(
+        `Geo rules for '${domain}' were written but no nginx server block ` +
+          `includes them, so nothing is enforced. Check that a server block ` +
+          `declares 'server_name ${domain};'.`
+      );
+    }
   }
 
   /**
