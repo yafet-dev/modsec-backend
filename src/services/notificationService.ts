@@ -353,7 +353,7 @@ export async function sendNotificationsForLogs(
     console.error(`      - SMTP_PORT`);
     console.error(`      - SMTP_USER`);
     console.error(`      - SMTP_PASS`);
-    console.error(`      - EMAIL_FROM (optional)`);
+    console.error(`      - SMTP_FROM (optional; defaults to SMTP_USER)`);
     return { sent: 0, failed: 0, errors: [] };
   }
   

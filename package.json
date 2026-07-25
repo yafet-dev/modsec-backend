@@ -18,7 +18,10 @@
     "worker:modsec": "tsx src/workers/modsecProcessorWorker.ts",
     "check:modsec": "tsx src/scripts/checkModsecLanding.ts",
     "check:tables": "tsx src/scripts/checkTables.ts",
-    "test:severity": "tsx src/services/__tests__/severityEnrichment.test.ts"
+    "test:severity": "tsx src/services/__tests__/severityEnrichment.test.ts",
+    "test:auth-email": "tsx src/services/__tests__/authEmailInfrastructure.test.ts",
+    "test:email-delivery": "tsx src/scripts/testEmailDeliveryMailTm.ts",
+    "test:email-routes": "tsx src/scripts/testEmailRoutesMailTm.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"

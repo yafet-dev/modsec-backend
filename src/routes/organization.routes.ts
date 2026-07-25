@@ -1,7 +1,20 @@
 import { Router, Request, Response } from "express";
-import { randomUUID } from "crypto";
 import { prisma } from "../lib/prisma";
 import { supabase, supabaseAdmin } from "../lib/supabase";
+import {
+  AUTH_EMAIL_TOKEN_PURPOSE,
+  createAuthEmailToken,
+  deleteAuthEmailToken,
+  invalidateOtherAuthEmailTokens,
+} from "../services/authEmailTokenService";
+import {
+  isAuthEmailConfigured,
+  sendInvitationEmail,
+} from "../services/authEmailService";
+import {
+  ensureSupabaseAuthUser,
+  normalizeEmail,
+} from "../services/authUserService";
 
 const router = Router();
 
@@ -335,126 +348,211 @@ router.post("/", async (req: Request, res: Response) => {
       });
     }
 
-    if (!adminEmail) {
+    if (!adminEmail || typeof adminEmail !== "string") {
       return res.status(400).json({
         message: "Admin email is required",
       });
     }
 
-    // Check if admin user exists in our database
-    let adminUser = await prisma.user.findUnique({
-      where: { email: adminEmail },
-    });
-
-    // Get frontend URL for invitation redirect
-    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
-
-    // Invite user via Supabase Admin API (creates user in Supabase Auth and sends email)
     if (!supabaseAdmin) {
       return res.status(500).json({
         message: "Supabase service role key not configured",
       });
     }
 
-    // Try to find user in Supabase Auth by listing users
-    let supabaseUserId: string | null = null;
+    if (!isAuthEmailConfigured()) {
+      return res.status(503).json({
+        message: "Email delivery is not configured",
+      });
+    }
+
+    const normalizedAdminEmail = normalizeEmail(adminEmail);
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailPattern.test(normalizedAdminEmail)) {
+      return res.status(400).json({
+        message: "A valid admin email is required",
+      });
+    }
+
+    let provisionedAuthUser:
+      | Awaited<ReturnType<typeof ensureSupabaseAuthUser>>
+      | undefined;
+    let adminUserCreated = false;
+    let mappedExistingUserId: string | undefined;
+    let organizationId: string | undefined;
+    let issuedTokenId: string | undefined;
+    let deliveryCommitted = false;
 
     try {
-      const { data: usersData } = await supabaseAdmin.auth.admin.listUsers();
-      const existingUser = usersData?.users?.find(
-        (u) => u.email === adminEmail
-      );
-
-      if (existingUser) {
-        supabaseUserId = existingUser.id;
-      }
-    } catch (error) {
-      console.warn("Error checking existing users:", error);
-    }
-
-    // If user doesn't exist in Supabase Auth, invite them
-    if (!supabaseUserId) {
-      const { data: inviteData, error: inviteError } =
-        await supabaseAdmin.auth.admin.inviteUserByEmail(adminEmail, {
-          data: {
-            organization_name: name,
-          },
-          redirectTo: `${frontendUrl}/accept-invitation`,
-        });
-
-      if (inviteError) {
-        console.error("Error inviting user:", inviteError);
-        return res.status(400).json({
-          message: "Failed to send invitation email",
-          error: inviteError.message,
-        });
-      }
-
-      if (inviteData?.user) {
-        supabaseUserId = inviteData.user.id;
-      }
-    }
-
-    // Create or update user in our database
-    if (!adminUser) {
-      // Use Supabase user ID if available, otherwise generate UUID
-      const userId = supabaseUserId || randomUUID();
-
-      adminUser = await prisma.user.create({
-        data: {
-          id: userId,
-          email: adminEmail,
-          fullName: null,
-        },
+      // This creates only an Auth identity. It never asks Supabase to send mail.
+      provisionedAuthUser = await ensureSupabaseAuthUser({
+        email: normalizedAdminEmail,
+        userMetadata: { organization_name: name },
       });
-    } else if (supabaseUserId && adminUser.id !== supabaseUserId) {
-      // Update user ID to match Supabase if different
-      // Note: This might cause issues if user already has relationships
-      // In production, you might want to handle this differently
-      console.warn(
-        `User ID mismatch for ${adminEmail}. Database: ${adminUser.id}, Supabase: ${supabaseUserId}`
-      );
-    }
 
-    // Create organization
-    const organization = await prisma.organization.create({
-      data: {
-        name,
-        domains,
-        ownerEmail: null, // Will be set when first admin accepts
-        status: "pending",
-      },
-    });
+      let adminUser = await prisma.user.findUnique({
+        where: { email: normalizedAdminEmail },
+      });
 
-    // Create organization member with pending status
-    await prisma.organizationMember.create({
-      data: {
-        userId: adminUser.id,
-        organizationId: organization.id,
-        role: "admin",
-        status: "pending",
-      },
-    });
+      if (
+        adminUser?.authUserId &&
+        adminUser.authUserId !== provisionedAuthUser.authUser.id
+      ) {
+        if (provisionedAuthUser.created) {
+          await supabaseAdmin.auth.admin.deleteUser(provisionedAuthUser.authUser.id);
+        }
+        return res.status(409).json({
+          message: "This email is linked to a different authentication account",
+        });
+      }
 
-    // Fetch the created organization with members
-    const createdOrg = await prisma.organization.findUnique({
-      where: { id: organization.id },
-      include: {
-        members: {
-          include: {
-            user: {
-              select: {
-                id: true,
-                email: true,
-                fullName: true,
+      if (!adminUser) {
+        adminUser = await prisma.user.create({
+          data: {
+            id: provisionedAuthUser.authUser.id,
+            authUserId: provisionedAuthUser.authUser.id,
+            email: normalizedAdminEmail,
+            fullName: null,
+          },
+        });
+        adminUserCreated = true;
+      } else if (!adminUser.authUserId) {
+        adminUser = await prisma.user.update({
+          where: { id: adminUser.id },
+          data: { authUserId: provisionedAuthUser.authUser.id },
+        });
+        mappedExistingUserId = adminUser.id;
+      }
+
+      const created = await prisma.$transaction(async (tx) => {
+        const organization = await tx.organization.create({
+          data: {
+            name,
+            domains,
+            ownerEmail: null,
+            status: "pending",
+          },
+        });
+
+        const membership = await tx.organizationMember.create({
+          data: {
+            userId: adminUser.id,
+            organizationId: organization.id,
+            role: "admin",
+            status: "pending",
+          },
+        });
+
+        return { organization, membership };
+      });
+      organizationId = created.organization.id;
+
+      // Complete all database reads before handing the message to SMTP. Once
+      // SMTP accepts it, destructive rollback would make the delivered link dead.
+      const createdOrg = await prisma.organization.findUnique({
+        where: { id: created.organization.id },
+        include: {
+          members: {
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  email: true,
+                  fullName: true,
+                },
               },
             },
           },
         },
-      },
-    });
+      });
+      if (!createdOrg) {
+        throw new Error("Created organization could not be reloaded");
+      }
 
-    res.status(201).json(createdOrg);
+      const issued = await createAuthEmailToken({
+        purpose: AUTH_EMAIL_TOKEN_PURPOSE.INVITATION,
+        email: normalizedAdminEmail,
+        authUserId: provisionedAuthUser.authUser.id,
+        organizationMemberId: created.membership.id,
+        requiresPassword: provisionedAuthUser.requiresPassword,
+      });
+      issuedTokenId = issued.record.id;
+
+      const delivery = await sendInvitationEmail({
+        to: normalizedAdminEmail,
+        token: issued.token,
+        organizationName: name,
+        role: "admin",
+        requiresPassword: provisionedAuthUser.requiresPassword,
+      });
+
+      if (!delivery.success) {
+        throw new Error(delivery.error || "SMTP delivery failed");
+      }
+      deliveryCommitted = true;
+
+      try {
+        await invalidateOtherAuthEmailTokens(issued.record);
+      } catch (error) {
+        console.error("Invitation sent but older tokens could not be invalidated:", error);
+      }
+
+      return res.status(201).json(createdOrg);
+    } catch (invitationError) {
+      console.error("Failed to create organization invitation:", invitationError);
+      const prismaCode = (invitationError as { code?: string }).code;
+
+      if (deliveryCommitted) {
+        if (!res.headersSent) {
+          return res.status(500).json({
+            message: "The organization and invitation were created, but the response could not be completed",
+          });
+        }
+        return;
+      }
+
+      if (issuedTokenId) {
+        await deleteAuthEmailToken(issuedTokenId).catch(() => undefined);
+      }
+      if (organizationId) {
+        await prisma.organization
+          .delete({ where: { id: organizationId } })
+          .catch(() => undefined);
+      }
+      if (adminUserCreated && provisionedAuthUser) {
+        await prisma.user
+          .delete({ where: { id: provisionedAuthUser.authUser.id } })
+          .catch(() => undefined);
+      }
+      if (mappedExistingUserId && provisionedAuthUser?.created) {
+        await prisma.user
+          .updateMany({
+            where: {
+              id: mappedExistingUserId,
+              authUserId: provisionedAuthUser.authUser.id,
+            },
+            data: { authUserId: null },
+          })
+          .catch(() => undefined);
+      }
+      if (provisionedAuthUser?.created) {
+        await supabaseAdmin.auth.admin
+          .deleteUser(provisionedAuthUser.authUser.id)
+          .catch(() => undefined);
+      }
+
+      if (prismaCode === "P2002") {
+        return res.status(409).json({
+          message: "Organization with this name or domain already exists",
+        });
+      }
+
+      return res.status(organizationId ? 502 : 500).json({
+        message: organizationId
+          ? "The organization was not created because the invitation email could not be delivered"
+          : "Failed to create organization",
+      });
+    }
   } catch (error: any) {
     console.error("Error creating organization:", error);
 

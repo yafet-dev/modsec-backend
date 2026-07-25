@@ -1,8 +1,62 @@
 import { Router, Request, Response } from "express";
-import { supabase } from "../lib/supabase";
+import { supabase, supabaseAdmin } from "../lib/supabase";
 import { prisma } from "../lib/prisma";
+import {
+  AUTH_EMAIL_TOKEN_PURPOSE,
+  claimAuthEmailToken,
+  createAuthEmailToken,
+  deleteAuthEmailToken,
+  findActiveAuthEmailToken,
+  invalidateAllOtherAuthEmailTokens,
+  invalidateOtherAuthEmailTokens,
+  releaseAuthEmailTokenClaim,
+} from "../services/authEmailTokenService";
+import {
+  isAuthEmailConfigured,
+  sendPasswordResetEmail,
+} from "../services/authEmailService";
+import {
+  findSupabaseAuthUserByEmail,
+  normalizeEmail,
+} from "../services/authUserService";
 
 const router = Router();
+
+const PASSWORD_RESET_WINDOW_MS = 15 * 60 * 1000;
+const PASSWORD_RESET_MAX_REQUESTS = 5;
+const PASSWORD_RESET_RESPONSE_FLOOR_MS = 350;
+const passwordResetAttempts = new Map<
+  string,
+  { count: number; resetAt: number }
+>();
+
+function isPasswordResetRateLimited(key: string): boolean {
+  const now = Date.now();
+  const current = passwordResetAttempts.get(key);
+  if (!current || current.resetAt <= now) {
+    if (!current && passwordResetAttempts.size >= 10_000) {
+      for (const [storedKey, attempt] of passwordResetAttempts) {
+        if (attempt.resetAt <= now) passwordResetAttempts.delete(storedKey);
+      }
+      if (passwordResetAttempts.size >= 10_000) return true;
+    }
+    passwordResetAttempts.set(key, {
+      count: 1,
+      resetAt: now + PASSWORD_RESET_WINDOW_MS,
+    });
+    return false;
+  }
+
+  current.count += 1;
+  return current.count > PASSWORD_RESET_MAX_REQUESTS;
+}
+
+async function waitForPasswordResetResponseFloor(startedAt: number): Promise<void> {
+  const remaining = PASSWORD_RESET_RESPONSE_FLOOR_MS - (Date.now() - startedAt);
+  if (remaining > 0) {
+    await new Promise((resolve) => setTimeout(resolve, remaining));
+  }
+}
 
 /**
  * @swagger
@@ -120,10 +174,19 @@ router.post("/login", async (req: Request, res: Response) => {
       });
     }
 
+    if (user.authUserId && user.authUserId !== data.user.id) {
+      return res.status(409).json({
+        message: "This account is linked to a different authentication identity",
+      });
+    }
+
     // Update last login timestamp
     await prisma.user.update({
       where: { id: user.id },
-      data: { lastLogin: new Date() },
+      data: {
+        lastLogin: new Date(),
+        ...(!user.authUserId && { authUserId: data.user.id }),
+      },
     });
 
     // Determine user role: super_admin from user.role, or organization member role
@@ -276,6 +339,18 @@ router.get("/me", async (req: Request, res: Response) => {
       });
     }
 
+    if (user.authUserId && user.authUserId !== supabaseUser.id) {
+      return res.status(409).json({
+        message: "This account is linked to a different authentication identity",
+      });
+    }
+    if (!user.authUserId) {
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { authUserId: supabaseUser.id },
+      });
+    }
+
     // Determine user role: super_admin from user.role, or organization member role
     let userRole: string | null = user.role; // super_admin or null
 
@@ -346,41 +421,107 @@ router.get("/me", async (req: Request, res: Response) => {
  *               $ref: '#/components/schemas/Error'
  */
 router.post("/forgot-password", async (req: Request, res: Response) => {
+  const startedAt = Date.now();
+  const genericResponse = {
+    message:
+      "If an account with that email exists, a password reset link has been sent.",
+  };
+  const respondGenerically = async () => {
+    await waitForPasswordResetResponseFloor(startedAt);
+    return res.json(genericResponse);
+  };
+  const { email } = req.body as { email?: string };
+
+  if (!email || typeof email !== "string") {
+    return res.status(400).json({ message: "Email is required" });
+  }
+
+  const normalizedEmail = normalizeEmail(email);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+    return res.status(400).json({ message: "A valid email is required" });
+  }
+  if (!supabaseAdmin || !isAuthEmailConfigured()) {
+    return res.status(503).json({
+      message: "Password reset email delivery is not configured",
+    });
+  }
+
+  // Account-scoped throttling works consistently behind reverse proxies and
+  // avoids one shared proxy address blocking resets for every customer.
+  if (isPasswordResetRateLimited(`account:${normalizedEmail}`)) {
+    return respondGenerically();
+  }
+
+  let issuedTokenId: string | undefined;
   try {
-    const { email } = req.body;
+    const localUser = await prisma.user.findUnique({
+      where: { email: normalizedEmail },
+    });
+    if (!localUser) {
+      return respondGenerically();
+    }
 
-    if (!email) {
-      return res.status(400).json({
-        message: "Email is required",
+    let authUser: Awaited<
+      ReturnType<typeof findSupabaseAuthUserByEmail>
+    >;
+    if (localUser.authUserId) {
+      const { data, error } = await supabaseAdmin.auth.admin.getUserById(
+        localUser.authUserId
+      );
+      if (error || !data.user) {
+        console.warn("Password reset ignored because the mapped Auth user is missing");
+        return respondGenerically();
+      }
+      authUser = data.user;
+    } else {
+      // Legacy records are repaired once; unknown public addresses never cause
+      // a paginated service-role scan of the Auth tenant.
+      authUser = await findSupabaseAuthUserByEmail(normalizedEmail);
+    }
+
+    if (!authUser || normalizeEmail(authUser.email || "") !== normalizedEmail) {
+      if (authUser) {
+        console.warn("Password reset ignored because the account mapping is inconsistent");
+      }
+      return respondGenerically();
+    }
+
+    if (!localUser.authUserId) {
+      await prisma.user.update({
+        where: { id: localUser.id },
+        data: { authUserId: authUser.id },
       });
     }
 
-    // Get frontend URL from environment for redirect
-    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
-
-    // Send password reset email via Supabase
-    const { error } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: `${frontendUrl}/reset-password`,
+    const issued = await createAuthEmailToken({
+      purpose: AUTH_EMAIL_TOKEN_PURPOSE.PASSWORD_RESET,
+      email: normalizedEmail,
+      authUserId: authUser.id,
     });
+    issuedTokenId = issued.record.id;
 
-    if (error) {
-      return res.status(400).json({
-        message: "Failed to send password reset email",
-        error: error.message,
-      });
+    const delivery = await sendPasswordResetEmail({
+      to: normalizedEmail,
+      token: issued.token,
+    });
+    if (!delivery.success) {
+      await deleteAuthEmailToken(issued.record.id).catch(() => undefined);
+      console.error("Password reset SMTP delivery failed:", delivery.error);
+      return respondGenerically();
     }
 
-    // Always return success for security (don't reveal if email exists)
-    res.json({
-      message:
-        "If an account with that email exists, a password reset link has been sent.",
-    });
+    try {
+      await invalidateOtherAuthEmailTokens(issued.record);
+    } catch (error) {
+      console.error("Reset email sent but older tokens could not be invalidated:", error);
+    }
+    return respondGenerically();
   } catch (error) {
-    console.error("Error sending password reset email:", error);
-    res.status(500).json({
-      message: "Failed to send password reset email",
-      error: error instanceof Error ? error.message : "Unknown error",
-    });
+    if (issuedTokenId) {
+      await deleteAuthEmailToken(issuedTokenId).catch(() => undefined);
+    }
+    console.error("Error processing password reset request:", error);
+    return respondGenerically();
   }
 });
 
@@ -388,7 +529,7 @@ router.post("/forgot-password", async (req: Request, res: Response) => {
  * @swagger
  * /api/auth/reset-password:
  *   post:
- *     summary: Reset password using access token
+ *     summary: Reset password using an application-issued one-time token
  *     tags: [Auth]
  *     requestBody:
  *       required: true
@@ -398,15 +539,15 @@ router.post("/forgot-password", async (req: Request, res: Response) => {
  *             type: object
  *             required:
  *               - password
- *               - access_token
+ *               - token
  *             properties:
  *               password:
  *                 type: string
  *                 format: password
  *                 description: New password
- *               access_token:
+ *               token:
  *                 type: string
- *                 description: Access token from Supabase after clicking reset link (frontend exchanges the token from email)
+ *                 description: One-time token from the backend SMTP email link
  *     responses:
  *       200:
  *         description: Password reset successfully
@@ -432,68 +573,72 @@ router.post("/forgot-password", async (req: Request, res: Response) => {
  *               $ref: '#/components/schemas/Error'
  */
 router.post("/reset-password", async (req: Request, res: Response) => {
+  const { password, token } = req.body as {
+    password?: string;
+    token?: string;
+  };
+
+  if (!password || !token) {
+    return res.status(400).json({ message: "Password and token are required" });
+  }
+  if (password.length < 6) {
+    return res.status(400).json({
+      message: "Password must be at least 6 characters long",
+    });
+  }
+  if (!supabaseAdmin) {
+    return res.status(500).json({
+      message: "Supabase service role key not configured",
+    });
+  }
+
   try {
-    const { password, access_token } = req.body;
-
-    if (!password || !access_token) {
-      return res.status(400).json({
-        message: "Password and access_token are required",
-      });
-    }
-
-    if (password.length < 6) {
-      return res.status(400).json({
-        message: "Password must be at least 6 characters long",
-      });
-    }
-
-    // Create a Supabase client instance for this request
-    const { createClient } = await import("@supabase/supabase-js");
-    const supabaseWithToken = createClient(
-      process.env.SUPABASE_URL!,
-      process.env.SUPABASE_ANON_KEY!
+    const emailToken = await findActiveAuthEmailToken(
+      token,
+      AUTH_EMAIL_TOKEN_PURPOSE.PASSWORD_RESET
     );
-
-    // Verify the access token is valid
-    const {
-      data: { user },
-      error: userError,
-    } = await supabaseWithToken.auth.getUser(access_token);
-
-    if (userError || !user) {
-      return res.status(400).json({
-        message: "Invalid or expired token",
-        error: userError?.message || "Token verification failed",
-      });
+    if (!emailToken) {
+      return res.status(400).json({ message: "Invalid or expired reset link" });
     }
 
-    // Set the session with the access token to update password
-    await supabaseWithToken.auth.setSession({
-      access_token: access_token,
-      refresh_token: access_token, // Frontend should ideally provide refresh_token
-    });
+    const claimedAt = await claimAuthEmailToken(emailToken.id);
+    if (!claimedAt) {
+      return res.status(400).json({ message: "Invalid or expired reset link" });
+    }
 
-    // Update the password
-    const { error: updateError } = await supabaseWithToken.auth.updateUser({
-      password: password,
-    });
+    let updateError: { message?: string } | null = null;
+    try {
+      const result = await supabaseAdmin.auth.admin.updateUserById(
+        emailToken.authUserId,
+        { password }
+      );
+      updateError = result.error;
+    } catch (error) {
+      // A timeout has an ambiguous outcome: Supabase may have committed the
+      // password change before the response was lost. Keep the token consumed.
+      console.error("Error resetting password:", error);
+      return res.status(500).json({ message: "Failed to reset password" });
+    }
 
     if (updateError) {
+      await releaseAuthEmailTokenClaim(emailToken.id, claimedAt);
       return res.status(400).json({
-        message: "Failed to reset password",
-        error: updateError.message,
+        message: "Password does not meet the account password requirements",
       });
     }
 
-    res.json({
-      message: "Password reset successfully",
-    });
+    try {
+      await invalidateAllOtherAuthEmailTokens(emailToken);
+    } catch (error) {
+      // The password has already changed and this token remains consumed.
+      // Never release it after the external action succeeds.
+      console.error("Failed to invalidate sibling password reset tokens:", error);
+    }
+
+    return res.json({ message: "Password reset successfully" });
   } catch (error) {
-    console.error("Error resetting password:", error);
-    res.status(500).json({
-      message: "Failed to reset password",
-      error: error instanceof Error ? error.message : "Unknown error",
-    });
+    console.error("Error preparing password reset:", error);
+    return res.status(500).json({ message: "Failed to reset password" });
   }
 });
 

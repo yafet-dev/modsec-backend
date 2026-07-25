@@ -11,6 +11,7 @@ datasource db {
 model User {
   id          String               @id
   email       String               @unique
+  authUserId  String?              @unique
   fullName    String?
   createdAt   DateTime             @default(now())
   updatedAt   DateTime             @updatedAt
@@ -18,6 +19,25 @@ model User {
   disabled    Boolean              @default(false)
   lastLogin   DateTime?
   memberships OrganizationMember[]
+}
+
+model AuthEmailToken {
+  id                   String    @id @default(uuid())
+  tokenHash            String    @unique
+  purpose              String
+  email                String
+  authUserId           String
+  organizationMemberId String?
+  requiresPassword     Boolean   @default(false)
+  expiresAt            DateTime
+  consumedAt           DateTime?
+  createdAt            DateTime  @default(now())
+
+  @@index([email, purpose])
+  @@index([authUserId, purpose])
+  @@index([organizationMemberId])
+  @@index([purpose, consumedAt, expiresAt])
+  @@index([expiresAt])
 }
 
 model OrganizationMember {
@@ -36,23 +56,23 @@ model OrganizationMember {
 }
 
 model Organization {
-  id         String               @id @default(uuid())
-  name       String
-  domains    String[]
-  ownerEmail String?
-  status     String               @default("pending")
+  id                     String                 @id @default(uuid())
+  name                   String
+  domains                String[]
+  ownerEmail             String?
+  status                 String                 @default("pending")
   /// Periodic WAF summary emails: daily | weekly | monthly | hourly
-  summaryReportFrequency String   @default("daily")
-  summaryReportEnabled   Boolean  @default(false)
-  summaryReportEmails    String[] @default([])
-  createdAt  DateTime             @default(now())
-  updatedAt  DateTime             @updatedAt
-  logs       Log[]
-  members    OrganizationMember[]
-  domainWafStatuses DomainWAFStatus[]
-  ipBans     IPBan[]
-  geoAccessControls GeoAccessControl[]
-  notificationSettings NotificationSettings[]
+  summaryReportFrequency String                 @default("daily")
+  summaryReportEnabled   Boolean                @default(false)
+  summaryReportEmails    String[]               @default([])
+  createdAt              DateTime               @default(now())
+  updatedAt              DateTime               @updatedAt
+  logs                   Log[]
+  members                OrganizationMember[]
+  domainWafStatuses      DomainWAFStatus[]
+  ipBans                 IPBan[]
+  geoAccessControls      GeoAccessControl[]
+  notificationSettings   NotificationSettings[]
 }
 
 model Log {
@@ -106,20 +126,20 @@ model ModsecLanding {
   data      Json     @map("data")
   processed Boolean? @default(false) @map("processed")
 
-  @@map("modsec_landing")
   @@index([processed])
   @@index([time])
   @@index([tag])
+  @@map("modsec_landing")
 }
 
 model IPBan {
   id             String       @id @default(uuid())
   organizationId String
   ip             String
-  domains        String[]     // Array of domains, or ["*"] for all domains
-  country        String?      // ISO country code (e.g., "US", "GB")
-  countryName    String?      // Full country name
-  reason         String?      // Reason for ban
+  domains        String[] // Array of domains, or ["*"] for all domains
+  country        String? // ISO country code (e.g., "US", "GB")
+  countryName    String? // Full country name
+  reason         String? // Reason for ban
   bannedAt       DateTime     @default(now())
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
@@ -135,10 +155,10 @@ model IPBanToken {
   id             String    @id @default(uuid())
   organizationId String
   ip             String
-  domains        String[]  // Array of domains to ban
+  domains        String[] // Array of domains to ban
   token          String    @unique // Temporary token for one-time use
   expiresAt      DateTime
-  usedAt        DateTime?
+  usedAt         DateTime?
   createdAt      DateTime  @default(now())
 
   @@index([token])
@@ -147,15 +167,15 @@ model IPBanToken {
 }
 
 model GeoAccessControl {
-  id             String       @id @default(uuid())
-  organizationId String
-  domain         String       // Domain name or "*" for all domains
-  mode           String       @default("allow-all") // "allow-all" | "allow-only" | "ban-specific"
-  allowedCountries String[]   @default([]) // ISO-3166-1 alpha-2 country codes
-  deniedCountries  String[]   @default([]) // ISO-3166-1 alpha-2 country codes
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
-  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  id               String       @id @default(uuid())
+  organizationId   String
+  domain           String // Domain name or "*" for all domains
+  mode             String       @default("allow-all") // "allow-all" | "allow-only" | "ban-specific"
+  allowedCountries String[]     @default([]) // ISO-3166-1 alpha-2 country codes
+  deniedCountries  String[]     @default([]) // ISO-3166-1 alpha-2 country codes
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+  organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
 
   @@unique([organizationId, domain])
   @@index([organizationId])
@@ -163,21 +183,21 @@ model GeoAccessControl {
 }
 
 model NotificationSettings {
-  id                   String       @id @default(uuid())
-  organizationId       String
-  notificationType     String       // "email" | "telegram"
-  emailList            String[]     @default([]) // Array of email addresses
-  telegramChatId       String?      // Telegram chat ID
-  telegramUserId       String?      // Telegram user ID
-  telegramEnabled      Boolean      @default(false) // Whether telegram is linked and active
-  telegramConnectedAt  DateTime?    // When telegram was connected
-  domainFilter         String       @default("all") // "all" | "specific"
-  selectedDomains      String[]     @default([]) // Array of domain names (empty if domainFilter is "all")
-  severityFilter       String       @default("all") // "all" | "critical" | "high" | "low"
-  enabled              Boolean      @default(true) // Whether notifications are enabled
-  createdAt            DateTime     @default(now())
-  updatedAt            DateTime     @updatedAt
-  organization         Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  id                  String       @id @default(uuid())
+  organizationId      String
+  notificationType    String // "email" | "telegram"
+  emailList           String[]     @default([]) // Array of email addresses
+  telegramChatId      String? // Telegram chat ID
+  telegramUserId      String? // Telegram user ID
+  telegramEnabled     Boolean      @default(false) // Whether telegram is linked and active
+  telegramConnectedAt DateTime? // When telegram was connected
+  domainFilter        String       @default("all") // "all" | "specific"
+  selectedDomains     String[]     @default([]) // Array of domain names (empty if domainFilter is "all")
+  severityFilter      String       @default("all") // "all" | "critical" | "high" | "low"
+  enabled             Boolean      @default(true) // Whether notifications are enabled
+  createdAt           DateTime     @default(now())
+  updatedAt           DateTime     @updatedAt
+  organization        Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
 
   @@index([organizationId])
   @@index([notificationType])
@@ -186,8 +206,8 @@ model NotificationSettings {
 
 model TelegramConnectRequest {
   id             String    @id @default(uuid())
-  userId         String    // User who initiated the connect
-  organizationId String    // Which org to connect Telegram for
+  userId         String // User who initiated the connect
+  organizationId String // Which org to connect Telegram for
   connectCode    String    @unique // e.g. "EAG-482193"
   expiresAt      DateTime
   usedAt         DateTime?
