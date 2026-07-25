@@ -30,19 +30,39 @@ journalctl -u your-backend-service -f
 
 ## 3. Common Issues
 
-### Issue: WAF Agent Private Key Not Set
+### Issue: WAF Agent Credentials Not Set
 
-**Symptom:** Server starts but WAF toggle requests fail with 502
+**Symptom:** Server starts but WAF toggle requests fail with 502, and the error
+reads `... is remote (...), so WAF_AGENT_PRIVATE_KEY and WAF_AGENT_AUTH_TOKEN
+must be set in .env`
 
-**Solution:** Make sure `WAF_AGENT_PRIVATE_KEY` is set in your `.env` file:
+**Cause:** `WAF_AGENT_URL` points at a public IP or domain. Credentials are only
+optional when the agent runs on localhost or a private network address.
 
-```env
-WAF_AGENT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----
-(paste your key here)
------END PRIVATE KEY-----"
-```
+**Solutions**, pick whichever matches your deployment:
 
-**Note:** The server will start even without the key, but WAF toggle calls will fail.
+1. **The agent really is remote** — set both credentials:
+
+   ```env
+   WAF_AGENT_AUTH_TOKEN="a-long-random-token"
+   WAF_AGENT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----
+   (paste your key here)
+   -----END PRIVATE KEY-----"
+   ```
+
+2. **The agent is actually on this machine, your LAN, or behind a tunnel** —
+   point the URL at its private address, and no credentials are needed:
+
+   ```env
+   WAF_AGENT_URL="http://localhost:8080"     # same host / SSH forward
+   WAF_AGENT_URL="http://10.8.0.3:8080"      # LAN or WireGuard peer
+   WAF_AGENT_URL="http://100.101.102.103:8080"  # Tailscale
+   ```
+
+There is no third option — no environment flag marks a public URL as trusted.
+
+**Note:** The server always starts; only the agent calls fail. Check the startup
+log line beginning with 🔒, 🔓, or ⚠️ to see which mode is active.
 
 ### Issue: Invalid Private Key Format
 

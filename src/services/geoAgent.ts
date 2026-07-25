@@ -1,10 +1,28 @@
+import {
+  normalizeEnvValue,
+  resolveAgentEndpoint,
+  type AgentEndpoint,
+} from "../utils/agentEndpoint";
+
 /**
  * Geo Agent Service
- * Handles communication with the Geo Agent to manage geo access control
+ * Handles communication with the Geo Agent to manage geo access control.
+ *
+ * Credential policy
+ * -----------------
+ * Mirrors the WAF agent: when the agent URL resolves to localhost or a private
+ * network address, the bearer token is OPTIONAL because the request never
+ * leaves the trusted network. When it points at a public IP or domain, the
+ * token is REQUIRED and calls fail fast instead of going out unauthenticated.
+ *
+ * The geo endpoints are not signature-protected on the agent side, so unlike
+ * the WAF toggle there is no private key involved here.
  */
 
+const DEFAULT_AGENT_URL = "http://localhost:8080";
+
 interface GeoAgentConfig {
-  url: string;
+  endpoint: AgentEndpoint;
   authToken: string;
 }
 
@@ -32,18 +50,143 @@ class GeoAgentService {
   private config: GeoAgentConfig;
 
   constructor() {
-    // Strip quotes from environment variables (common issue with .env files)
-    // Default to WAF_AGENT_URL (port 8080) since geo endpoints are now in the same service
-    const agentUrl = (process.env.GEO_AGENT_URL || process.env.WAF_AGENT_URL || "http://localhost:8080")
-      .replace(/^["']|["']$/g, "") // Remove surrounding quotes
-      .trim();
-    const authToken = (process.env.GEO_AGENT_AUTH_TOKEN || process.env.WAF_AGENT_AUTH_TOKEN || "test-token")
-      .replace(/^["']|["']$/g, "") // Remove surrounding quotes
-      .trim();
+    // Default to WAF_AGENT_URL (port 8080) since the geo endpoints now live in
+    // the same service.
+    const endpoint = resolveAgentEndpoint(
+      normalizeEnvValue(process.env.GEO_AGENT_URL) ||
+        normalizeEnvValue(process.env.WAF_AGENT_URL),
+      DEFAULT_AGENT_URL
+    );
 
     this.config = {
-      url: agentUrl,
-      authToken,
+      endpoint,
+      authToken:
+        normalizeEnvValue(process.env.GEO_AGENT_AUTH_TOKEN) ||
+        normalizeEnvValue(process.env.WAF_AGENT_AUTH_TOKEN),
+    };
+
+    this.logConfiguration();
+  }
+
+  /** True when the agent sits outside the trusted network. */
+  private get credentialsRequired(): boolean {
+    return !this.config.endpoint.isLocal;
+  }
+
+  /** Report the credential posture once at startup. */
+  private logConfiguration(): void {
+    const { endpoint } = this.config;
+
+    if (!this.credentialsRequired) {
+      console.log(
+        `🔓 Geo Agent at ${endpoint.url} is local (${endpoint.reason}). Auth token is optional.`
+      );
+      return;
+    }
+
+    if (!this.config.authToken) {
+      console.warn(
+        `⚠️  Geo Agent at ${endpoint.url} is remote (${endpoint.reason}) but ` +
+          "GEO_AGENT_AUTH_TOKEN / WAF_AGENT_AUTH_TOKEN is missing. Geo agent calls will fail until configured."
+      );
+      return;
+    }
+
+    console.log(
+      `🔒 Geo Agent at ${endpoint.url} is remote (${endpoint.reason}). Requests are authenticated.`
+    );
+  }
+
+  /**
+   * Block the call when a remote agent is configured without a token.
+   * Local agents always pass.
+   */
+  private assertCredentialsConfigured(): void {
+    if (!this.credentialsRequired || this.config.authToken) return;
+
+    throw new Error(
+      `Geo agent at ${this.config.endpoint.url} is remote (${this.config.endpoint.reason}), ` +
+        "so GEO_AGENT_AUTH_TOKEN (or WAF_AGENT_AUTH_TOKEN) must be set in .env. " +
+        "The token is only optional when the agent runs on localhost or a private network address."
+    );
+  }
+
+  /** Authorization header, present only when a token is configured. */
+  private buildHeaders(includeJson: boolean): Record<string, string> {
+    const headers: Record<string, string> = {};
+    if (includeJson) headers["Content-Type"] = "application/json";
+    if (this.config.authToken) {
+      headers.Authorization = `Bearer ${this.config.authToken}`;
+    }
+    return headers;
+  }
+
+  /**
+   * Issue a request to the agent and decode the JSON response.
+   * Wraps transport failures with the target URL so an unreachable agent is
+   * identifiable from the error alone.
+   */
+  private async agentFetch<T>(
+    path: string,
+    init: { method: string; body?: string; includeJson: boolean }
+  ): Promise<T> {
+    this.assertCredentialsConfigured();
+
+    const target = `${this.config.endpoint.url}${path}`;
+
+    let response: Response;
+    try {
+      response = await fetch(target, {
+        method: init.method,
+        headers: this.buildHeaders(init.includeJson),
+        body: init.body,
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Unknown error";
+      throw new Error(
+        `Could not reach Geo agent at ${target}: ${detail}. ` +
+          "Check that the agent is running and that GEO_AGENT_URL / WAF_AGENT_URL is correct."
+      );
+    }
+
+    if (!response.ok) {
+      const errorBody = await response.text().catch(() => "");
+      const hint =
+        response.status === 401 || response.status === 403
+          ? " (the agent rejected the credentials — check GEO_AGENT_AUTH_TOKEN)"
+          : "";
+      throw new Error(
+        `Geo Agent returned ${response.status}: ${errorBody || response.statusText}${hint}`
+      );
+    }
+
+    return (await response.json()) as T;
+  }
+
+  /**
+   * Configuration snapshot for diagnostics. Reports whether a token is
+   * present, never what it is.
+   */
+  getStatusInfo(): {
+    url: string;
+    hostname: string;
+    isLocal: boolean;
+    reason: string;
+    credentialsRequired: boolean;
+    hasAuthToken: boolean;
+    ready: boolean;
+  } {
+    const { endpoint } = this.config;
+    const hasAuthToken = this.config.authToken.length > 0;
+
+    return {
+      url: endpoint.url,
+      hostname: endpoint.hostname,
+      isLocal: endpoint.isLocal,
+      reason: endpoint.reason,
+      credentialsRequired: this.credentialsRequired,
+      hasAuthToken,
+      ready: !this.credentialsRequired || hasAuthToken,
     };
   }
 
@@ -51,199 +194,63 @@ class GeoAgentService {
    * Set the geo access mode (allow_only or deny_only)
    */
   async setMode(mode: "allow_only" | "deny_only", force: boolean = false): Promise<GeoAgentModeResponse> {
-    try {
-      const response = await fetch(`${this.config.url}/v1/geo/mode`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.config.authToken}`,
-        },
-        body: JSON.stringify({
-          mode,
-          force,
-        }),
-      });
-
-      if (!response.ok) {
-        const errorBody = await response.text();
-        throw new Error(
-          `Geo Agent returned ${response.status}: ${errorBody || response.statusText}`
-        );
-      }
-
-      const result = await response.json() as GeoAgentModeResponse;
-      return result;
-    } catch (error) {
-      if (error instanceof Error) {
-        throw error;
-      }
-      throw new Error(
-        `Failed to communicate with Geo agent: ${error instanceof Error ? error.message : "Unknown error"}`
-      );
-    }
+    return this.agentFetch<GeoAgentModeResponse>("/v1/geo/mode", {
+      method: "POST",
+      body: JSON.stringify({ mode, force }),
+      includeJson: true,
+    });
   }
 
   /**
    * Add a country to the allow list
    */
   async addAllowCountry(country: string): Promise<GeoAgentCountryResponse> {
-    try {
-      const response = await fetch(`${this.config.url}/v1/geo/allow`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.config.authToken}`,
-        },
-        body: JSON.stringify({
-          country,
-        }),
-      });
-
-      if (!response.ok) {
-        const errorBody = await response.text();
-        throw new Error(
-          `Geo Agent returned ${response.status}: ${errorBody || response.statusText}`
-        );
-      }
-
-      const result = await response.json() as GeoAgentCountryResponse;
-      return result;
-    } catch (error) {
-      if (error instanceof Error) {
-        throw error;
-      }
-      throw new Error(
-        `Failed to communicate with Geo agent: ${error instanceof Error ? error.message : "Unknown error"}`
-      );
-    }
+    return this.agentFetch<GeoAgentCountryResponse>("/v1/geo/allow", {
+      method: "POST",
+      body: JSON.stringify({ country }),
+      includeJson: true,
+    });
   }
 
   /**
    * Remove a country from the allow list
    */
   async removeAllowCountry(country: string, force: boolean = false): Promise<GeoAgentCountryResponse> {
-    try {
-      const response = await fetch(`${this.config.url}/v1/geo/allow/${country}?force=${force}`, {
-        method: "DELETE",
-        headers: {
-          Authorization: `Bearer ${this.config.authToken}`,
-        },
-      });
-
-      if (!response.ok) {
-        const errorBody = await response.text();
-        throw new Error(
-          `Geo Agent returned ${response.status}: ${errorBody || response.statusText}`
-        );
-      }
-
-      const result = await response.json() as GeoAgentCountryResponse;
-      return result;
-    } catch (error) {
-      if (error instanceof Error) {
-        throw error;
-      }
-      throw new Error(
-        `Failed to communicate with Geo agent: ${error instanceof Error ? error.message : "Unknown error"}`
-      );
-    }
+    return this.agentFetch<GeoAgentCountryResponse>(
+      `/v1/geo/allow/${encodeURIComponent(country)}?force=${force}`,
+      { method: "DELETE", includeJson: false }
+    );
   }
 
   /**
    * Add a country to the deny list
    */
   async addDenyCountry(country: string): Promise<GeoAgentCountryResponse> {
-    try {
-      const response = await fetch(`${this.config.url}/v1/geo/deny`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.config.authToken}`,
-        },
-        body: JSON.stringify({
-          country,
-        }),
-      });
-
-      if (!response.ok) {
-        const errorBody = await response.text();
-        throw new Error(
-          `Geo Agent returned ${response.status}: ${errorBody || response.statusText}`
-        );
-      }
-
-      const result = await response.json() as GeoAgentCountryResponse;
-      return result;
-    } catch (error) {
-      if (error instanceof Error) {
-        throw error;
-      }
-      throw new Error(
-        `Failed to communicate with Geo agent: ${error instanceof Error ? error.message : "Unknown error"}`
-      );
-    }
+    return this.agentFetch<GeoAgentCountryResponse>("/v1/geo/deny", {
+      method: "POST",
+      body: JSON.stringify({ country }),
+      includeJson: true,
+    });
   }
 
   /**
    * Remove a country from the deny list
    */
   async removeDenyCountry(country: string): Promise<GeoAgentCountryResponse> {
-    try {
-      const response = await fetch(`${this.config.url}/v1/geo/deny/${country}`, {
-        method: "DELETE",
-        headers: {
-          Authorization: `Bearer ${this.config.authToken}`,
-        },
-      });
-
-      if (!response.ok) {
-        const errorBody = await response.text();
-        throw new Error(
-          `Geo Agent returned ${response.status}: ${errorBody || response.statusText}`
-        );
-      }
-
-      const result = await response.json() as GeoAgentCountryResponse;
-      return result;
-    } catch (error) {
-      if (error instanceof Error) {
-        throw error;
-      }
-      throw new Error(
-        `Failed to communicate with Geo agent: ${error instanceof Error ? error.message : "Unknown error"}`
-      );
-    }
+    return this.agentFetch<GeoAgentCountryResponse>(
+      `/v1/geo/deny/${encodeURIComponent(country)}`,
+      { method: "DELETE", includeJson: false }
+    );
   }
 
   /**
    * Get current geo access status from agent
    */
   async getStatus(): Promise<GeoAgentStatusResponse> {
-    try {
-      const response = await fetch(`${this.config.url}/v1/geo/status`, {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${this.config.authToken}`,
-        },
-      });
-
-      if (!response.ok) {
-        const errorBody = await response.text();
-        throw new Error(
-          `Geo Agent returned ${response.status}: ${errorBody || response.statusText}`
-        );
-      }
-
-      const result = await response.json() as GeoAgentStatusResponse;
-      return result;
-    } catch (error) {
-      if (error instanceof Error) {
-        throw error;
-      }
-      throw new Error(
-        `Failed to communicate with Geo agent: ${error instanceof Error ? error.message : "Unknown error"}`
-      );
-    }
+    return this.agentFetch<GeoAgentStatusResponse>("/v1/geo/status", {
+      method: "GET",
+      includeJson: false,
+    });
   }
 
   /**
@@ -346,13 +353,13 @@ class GeoAgentService {
    */
   async checkHealth(): Promise<boolean> {
     try {
-      const response = await fetch(`${this.config.url}/health`, {
+      const response = await fetch(`${this.config.endpoint.url}/health`, {
         method: "GET",
-        timeout: 5000,
-      } as any);
+        signal: AbortSignal.timeout(5000),
+      });
 
       return response.ok;
-    } catch (error) {
+    } catch {
       return false;
     }
   }

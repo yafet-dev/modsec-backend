@@ -106,17 +106,81 @@ ID is used.
 
 ## WAF and Geo agents
 
-Geo endpoints normally share the WAF agent on port 8080:
+Geo endpoints normally share the WAF agent on port 8080. **Which credentials you
+need depends on where the agent runs.**
+
+### Local agent — no credentials needed
+
+When `WAF_AGENT_URL` resolves to the local machine or a private network, the
+signing key and auth token are optional. Requests never leave the trusted
+network, so the backend calls the agent unauthenticated:
 
 ```env
 WAF_AGENT_URL="http://localhost:8080"
-WAF_AGENT_AUTH_TOKEN="your-shared-token"
-# WAF_AGENT_PRIVATE_KEY="your-PEM-private-key"
+```
 
-# Optional overrides; otherwise the WAF values are used.
+That is all. A URL counts as local when its host is:
+
+| Category | Examples |
+| --- | --- |
+| Loopback | `localhost`, `127.0.0.1`, `::1` |
+| Private IPv4 (RFC 1918) | `10.0.0.5`, `172.16.0.1`–`172.31.255.254`, `192.168.1.50` |
+| Link-local | `169.254.x.x`, `fe80::/10` |
+| CGNAT / VPN mesh | `100.64.0.0/10` (this is the range Tailscale uses) |
+| Private IPv6 | `fd00::1` and the rest of `fc00::/7` |
+| Container service name | `waf-agent`, `agent` (single-label, no public TLD) |
+| Private-use domains | `agent.local`, `agent.internal`, `box.home.arpa` |
+
+### Remote agent — key and token required
+
+When `WAF_AGENT_URL` is a public IP or public domain, both credentials are
+required and calls fail fast with an explicit error if either is missing:
+
+```env
+WAF_AGENT_URL="http://196.188.250.141:8080"
+WAF_AGENT_AUTH_TOKEN="your-shared-token"
+WAF_AGENT_PRIVATE_KEY="your-PEM-private-key"
+```
+
+The backend holds the **private** key and signs each toggle request; the agent
+holds the matching **public** key and verifies the signature. See
+`WAF_AGENT_SETUP.md` for how to generate and install the pair.
+
+Credentials are always used when set — configuring them against a local agent
+just keeps requests authenticated. The rule only governs what is *required*.
+
+### There is no bypass flag
+
+Deliberately. An agent reached over WireGuard, Tailscale, or an SSH forward is
+addressed by its private endpoint — `10.x`, `100.64.x`, or `localhost:PORT` —
+so a tunnelled agent already classifies as local and needs no override. The only
+thing a bypass could enable is an unauthenticated public agent, which is exactly
+what this rule exists to prevent.
+
+If a remote agent is being refused, you have two real options: supply the
+credentials, or point `WAF_AGENT_URL` at the agent's private address.
+
+### Geo overrides
+
+The geo endpoints reuse the WAF values unless overridden. They are token-only —
+the agent does not signature-check them, so no private key is involved:
+
+```env
 # GEO_AGENT_URL="http://localhost:8080"
 # GEO_AGENT_AUTH_TOKEN="your-geo-token"
 ```
+
+### Verifying the configuration
+
+The backend prints its credential posture at startup:
+
+```
+🔓 WAF Agent at http://localhost:8080 is local (loopback hostname ("localhost")). Signing key and auth token are optional.
+🔒 WAF Agent at http://196.188.250.141:8080 is remote ("196.188.250.141" is a publicly routable host). Requests are signed and authenticated.
+⚠️  WAF Agent at http://196.188.250.141:8080 is remote (...) but WAF_AGENT_PRIVATE_KEY and WAF_AGENT_AUTH_TOKEN missing. WAF agent calls will fail until configured.
+```
+
+Run `npm run test:agent-policy` to exercise the classification rules.
 
 Background schedules, summary-report settings, Telegram integration, and the
 remaining optional service keys are documented with safe placeholders in
