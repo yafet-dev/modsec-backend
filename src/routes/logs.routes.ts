@@ -2,8 +2,37 @@ import { Router, Request, Response } from "express";
 import { prisma } from "../lib/prisma";
 import { supabase } from "../lib/supabase";
 import { getLocationsFromIPs } from "../utils/ipGeolocation";
+import { buildHostCondition } from "../utils/hostFilter";
 
 const router = Router();
+
+/**
+ * Restrict a query to the logs a user is allowed to see.
+ *
+ * Returns null when the user has no organizations, meaning the caller should
+ * short-circuit to an empty result rather than querying.
+ */
+function buildAccessScope(
+  currentUser: {
+    role: string | null;
+    memberships: { organizationId: string }[];
+  },
+  organizationIdFilter?: string
+): Record<string, any> | null {
+  if (currentUser.role === "super_admin") {
+    return organizationIdFilter
+      ? { organizationId: organizationIdFilter }
+      : {};
+  }
+
+  const userOrganizationIds = currentUser.memberships.map(
+    (m) => m.organizationId
+  );
+
+  if (userOrganizationIds.length === 0) return null;
+
+  return { organizationId: { in: userOrganizationIds } };
+}
 
 /**
  * @swagger
@@ -171,12 +200,15 @@ router.get("/", async (req: Request, res: Response) => {
       };
     }
 
-    // Apply filters
+    // Apply filters.
+    //
+    // Each filter that needs an OR goes into its own AND entry. Assigning
+    // where.OR directly would mean the host filter and the search filter
+    // overwrite one another, silently dropping whichever was set first.
+    const conditions: any[] = [];
+
     if (hostFilter) {
-      where.host = {
-        contains: hostFilter,
-        mode: "insensitive",
-      };
+      conditions.push(buildHostCondition(hostFilter));
     }
 
     if (severityFilter) {
@@ -189,12 +221,19 @@ router.get("/", async (req: Request, res: Response) => {
 
     // Search filter (search in multiple fields)
     if (searchQuery) {
-      where.OR = [
-        { requestUrl: { contains: searchQuery, mode: "insensitive" } },
-        { clientIp: { contains: searchQuery, mode: "insensitive" } },
-        { ruleId: { contains: searchQuery, mode: "insensitive" } },
-        { message: { contains: searchQuery, mode: "insensitive" } },
-      ];
+      conditions.push({
+        OR: [
+          { requestUrl: { contains: searchQuery, mode: "insensitive" } },
+          { clientIp: { contains: searchQuery, mode: "insensitive" } },
+          { ruleId: { contains: searchQuery, mode: "insensitive" } },
+          { message: { contains: searchQuery, mode: "insensitive" } },
+          { host: { contains: searchQuery, mode: "insensitive" } },
+        ],
+      });
+    }
+
+    if (conditions.length > 0) {
+      where.AND = conditions;
     }
 
     // Fetch logs with pagination
@@ -267,6 +306,102 @@ router.get("/", async (req: Request, res: Response) => {
     console.error("Error fetching logs:", error);
     res.status(500).json({
       message: "Failed to fetch logs",
+      error: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/logs/hosts:
+ *   get:
+ *     summary: List the hosts that actually appear in the caller's logs
+ *     description: >
+ *       Returns the distinct host values present in logs the caller can see,
+ *       with a count for each. The organization's registered domains are the
+ *       apex names (for example gnzabe.com) while traffic arrives on
+ *       subdomains (apiprod.gnzabe.com), so a selector built only from
+ *       registered domains cannot target the host you actually want.
+ *     tags: [Logs]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Distinct hosts with log counts, most frequent first
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 hosts:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       host:
+ *                         type: string
+ *                       count:
+ *                         type: integer
+ *       401:
+ *         description: Unauthorized
+ *       500:
+ *         description: Server error
+ */
+router.get("/hosts", async (req: Request, res: Response) => {
+  try {
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.replace("Bearer ", "");
+
+    if (!token) {
+      return res.status(401).json({ message: "No token provided" });
+    }
+
+    const {
+      data: { user: supabaseUser },
+      error,
+    } = await supabase.auth.getUser(token);
+
+    if (error || !supabaseUser) {
+      return res.status(401).json({ message: "Invalid or expired token" });
+    }
+
+    const currentUser = await prisma.user.findUnique({
+      where: { email: supabaseUser.email! },
+      select: {
+        id: true,
+        role: true,
+        memberships: { select: { organizationId: true } },
+      },
+    });
+
+    if (!currentUser) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const organizationIdFilter = req.query.organizationId as string | undefined;
+    const scope = buildAccessScope(currentUser, organizationIdFilter);
+
+    // No organizations means no logs to describe.
+    if (scope === null) {
+      return res.json({ hosts: [] });
+    }
+
+    const grouped = await prisma.log.groupBy({
+      by: ["host"],
+      where: scope,
+      _count: { host: true },
+      orderBy: { _count: { host: "desc" } },
+    });
+
+    res.json({
+      hosts: grouped
+        .filter((row) => row.host && row.host.trim() !== "")
+        .map((row) => ({ host: row.host, count: row._count.host })),
+    });
+  } catch (error) {
+    console.error("Error fetching log hosts:", error);
+    res.status(500).json({
+      message: "Failed to fetch log hosts",
       error: error instanceof Error ? error.message : "Unknown error",
     });
   }
@@ -394,12 +529,9 @@ router.get("/attack-origins", async (req: Request, res: Response) => {
       };
     }
 
-    // Apply host filter
+    // Apply host filter (matches the host and its subdomains, nothing else)
     if (hostFilter) {
-      where.host = {
-        contains: hostFilter,
-        mode: "insensitive",
-      };
+      where.AND = [buildHostCondition(hostFilter)];
     }
 
     // Fetch all logs (no time filter - show all attack origins)

@@ -103,6 +103,7 @@ model Log {
   @@index([clientIp])
   @@index([action])
   @@index([severity])
+  @@index([host])
 }
 
 model DomainWAFStatus {
