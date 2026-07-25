@@ -509,14 +509,38 @@ router.post("/:id/geo-access", async (req: Request, res: Response) => {
       });
     }
 
-    // Sync with geo-agent first (before saving to database)
-    // Note: The geo-agent manages a single global config, so we sync whenever settings are saved
-    // For now, we sync for all domains. Later you can add logic to sync only for specific domains.
+    // Resolve which real hostnames to push to the agent. The agent keys every
+    // rule by domain and cannot accept the "*" wildcard, so "*" fans out to
+    // each of the organization's domains.
+    const targetDomains =
+      normalizedDomain === "*"
+        ? organization.domains.map((d) => d.toLowerCase().trim()).filter(Boolean)
+        : [normalizedDomain];
+
+    if (targetDomains.length === 0) {
+      return res.status(400).json({
+        message:
+          "This organization has no domains, so there is nothing to apply geo access settings to.",
+        details:
+          "Add a domain to the organization before configuring geo access control.",
+      });
+    }
+
+    // Sync with the geo agent before saving, so the database only reflects
+    // rules nginx actually accepted.
     try {
       console.log(
-        `Syncing geo access settings to agent: mode=${mode}, allowed=${finalAllowed.length}, denied=${finalDenied.length}`
+        `Syncing geo access settings to agent for ${targetDomains.join(", ")}: ` +
+          `mode=${mode}, allowed=${finalAllowed.length}, denied=${finalDenied.length}`
       );
-      await geoAgentService.syncSettings(mode, finalAllowed, finalDenied);
+      for (const targetDomain of targetDomains) {
+        await geoAgentService.syncSettings(
+          targetDomain,
+          mode,
+          finalAllowed,
+          finalDenied
+        );
+      }
       console.log("Geo agent sync completed successfully");
     } catch (agentError) {
       console.error("Geo agent sync error:", agentError);

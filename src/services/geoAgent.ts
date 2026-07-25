@@ -41,9 +41,15 @@ interface GeoAgentCountryResponse {
 }
 
 interface GeoAgentStatusResponse {
+  domain: string;
   mode: string;
   allow: string[];
   deny: string[];
+}
+
+interface GeoAgentAllStatusResponse {
+  domains: GeoAgentStatusResponse[];
+  total_domains: number;
 }
 
 class GeoAgentService {
@@ -193,159 +199,194 @@ class GeoAgentService {
   /**
    * Set the geo access mode (allow_only or deny_only)
    */
-  async setMode(mode: "allow_only" | "deny_only", force: boolean = false): Promise<GeoAgentModeResponse> {
-    return this.agentFetch<GeoAgentModeResponse>("/v1/geo/mode", {
-      method: "POST",
-      body: JSON.stringify({ mode, force }),
-      includeJson: true,
-    });
+  async setMode(
+    domain: string,
+    mode: "allow_only" | "deny_only",
+    force: boolean = false
+  ): Promise<GeoAgentModeResponse> {
+    return this.agentFetch<GeoAgentModeResponse>(
+      `/v1/geo/${encodeURIComponent(domain)}/mode`,
+      {
+        method: "POST",
+        body: JSON.stringify({ mode, force }),
+        includeJson: true,
+      }
+    );
   }
 
   /**
-   * Add a country to the allow list
+   * Add a country to a domain's allow list
    */
-  async addAllowCountry(country: string): Promise<GeoAgentCountryResponse> {
-    return this.agentFetch<GeoAgentCountryResponse>("/v1/geo/allow", {
-      method: "POST",
-      body: JSON.stringify({ country }),
-      includeJson: true,
-    });
-  }
-
-  /**
-   * Remove a country from the allow list
-   */
-  async removeAllowCountry(country: string, force: boolean = false): Promise<GeoAgentCountryResponse> {
+  async addAllowCountry(
+    domain: string,
+    country: string
+  ): Promise<GeoAgentCountryResponse> {
     return this.agentFetch<GeoAgentCountryResponse>(
-      `/v1/geo/allow/${encodeURIComponent(country)}?force=${force}`,
+      `/v1/geo/${encodeURIComponent(domain)}/allow`,
+      {
+        method: "POST",
+        body: JSON.stringify({ country }),
+        includeJson: true,
+      }
+    );
+  }
+
+  /**
+   * Remove a country from a domain's allow list
+   */
+  async removeAllowCountry(
+    domain: string,
+    country: string,
+    force: boolean = false
+  ): Promise<GeoAgentCountryResponse> {
+    return this.agentFetch<GeoAgentCountryResponse>(
+      `/v1/geo/${encodeURIComponent(domain)}/allow/${encodeURIComponent(country)}?force=${force}`,
       { method: "DELETE", includeJson: false }
     );
   }
 
   /**
-   * Add a country to the deny list
+   * Add a country to a domain's deny list
    */
-  async addDenyCountry(country: string): Promise<GeoAgentCountryResponse> {
-    return this.agentFetch<GeoAgentCountryResponse>("/v1/geo/deny", {
-      method: "POST",
-      body: JSON.stringify({ country }),
-      includeJson: true,
-    });
+  async addDenyCountry(
+    domain: string,
+    country: string
+  ): Promise<GeoAgentCountryResponse> {
+    return this.agentFetch<GeoAgentCountryResponse>(
+      `/v1/geo/${encodeURIComponent(domain)}/deny`,
+      {
+        method: "POST",
+        body: JSON.stringify({ country }),
+        includeJson: true,
+      }
+    );
   }
 
   /**
-   * Remove a country from the deny list
+   * Remove a country from a domain's deny list
    */
-  async removeDenyCountry(country: string): Promise<GeoAgentCountryResponse> {
+  async removeDenyCountry(
+    domain: string,
+    country: string
+  ): Promise<GeoAgentCountryResponse> {
     return this.agentFetch<GeoAgentCountryResponse>(
-      `/v1/geo/deny/${encodeURIComponent(country)}`,
+      `/v1/geo/${encodeURIComponent(domain)}/deny/${encodeURIComponent(country)}`,
       { method: "DELETE", includeJson: false }
     );
   }
 
   /**
-   * Get current geo access status from agent
+   * Get a single domain's geo status from the agent.
+   *
+   * A domain the agent has never seen reports mode "unknown" with empty lists
+   * rather than erroring, so this is safe to call before anything is configured.
    */
-  async getStatus(): Promise<GeoAgentStatusResponse> {
-    return this.agentFetch<GeoAgentStatusResponse>("/v1/geo/status", {
+  async getStatus(domain: string): Promise<GeoAgentStatusResponse> {
+    return this.agentFetch<GeoAgentStatusResponse>(
+      `/v1/geo/${encodeURIComponent(domain)}/status`,
+      { method: "GET", includeJson: false }
+    );
+  }
+
+  /**
+   * Get geo status for every domain the agent has configured.
+   */
+  async getAllStatus(): Promise<GeoAgentAllStatusResponse> {
+    return this.agentFetch<GeoAgentAllStatusResponse>("/v1/geo/status", {
       method: "GET",
       includeJson: false,
     });
   }
 
   /**
-   * Sync geo access settings to the agent
-   * This is a high-level method that sets mode and syncs all countries
+   * Sync one domain's geo access settings to the agent.
+   *
+   * Sets the mode and reconciles both country lists. The agent provisions the
+   * domain's nginx files on the first call, so a domain that has never had geo
+   * settings before works without any manual setup.
    */
   async syncSettings(
+    domain: string,
     mode: "allow-all" | "allow-only" | "ban-specific",
     allowedCountries: string[],
     deniedCountries: string[]
   ): Promise<void> {
-    try {
-      // Get current status from agent
-      const currentStatus = await this.getStatus();
-
-      // Determine agent mode based on backend mode
-      if (mode === "allow-all") {
-        // For allow-all: set to deny_only with empty deny list (effectively allows all)
-        // First, clear all deny countries
-        for (const country of currentStatus.deny) {
-          await this.removeDenyCountry(country);
-        }
-        
-        // Clear all allow countries (shouldn't be any in deny_only mode, but just in case)
-        for (const country of currentStatus.allow) {
-          await this.removeAllowCountry(country, true);
-        }
-        
-        // Set mode to deny_only (with empty deny list = allows all)
-        await this.setMode("deny_only", true);
-      } else if (mode === "allow-only") {
-        // For allow-only: sync lists first, then set mode
-        
-        // Clear all deny countries first (they shouldn't exist in allow_only mode)
-        for (const country of currentStatus.deny) {
-          await this.removeDenyCountry(country);
-        }
-
-        // Sync allow list: remove countries not in new list, add countries not in current list
-        const currentAllowSet = new Set(currentStatus.allow);
-        const newAllowSet = new Set(allowedCountries);
-
-        // Remove countries that are no longer allowed
-        for (const country of currentAllowSet) {
-          if (!newAllowSet.has(country)) {
-            await this.removeAllowCountry(country, true);
-          }
-        }
-
-        // Add new allowed countries
-        for (const country of allowedCountries) {
-          if (!currentAllowSet.has(country)) {
-            await this.addAllowCountry(country);
-          }
-        }
-
-        // Set mode to allow_only (use force=true if list is empty, though backend should prevent this)
-        await this.setMode("allow_only", allowedCountries.length === 0);
-      } else if (mode === "ban-specific") {
-        // For ban-specific: sync lists first, then set mode
-        
-        // Clear all allow countries first (they shouldn't exist in deny_only mode)
-        for (const country of currentStatus.allow) {
-          await this.removeAllowCountry(country, true);
-        }
-
-        // Sync deny list: remove countries not in new list, add countries not in current list
-        const currentDenySet = new Set(currentStatus.deny);
-        const newDenySet = new Set(deniedCountries);
-
-        // Remove countries that are no longer denied
-        for (const country of currentDenySet) {
-          if (!newDenySet.has(country)) {
-            await this.removeDenyCountry(country);
-          }
-        }
-
-        // Add new denied countries
-        for (const country of deniedCountries) {
-          if (!currentDenySet.has(country)) {
-            await this.addDenyCountry(country);
-          }
-        }
-
-        // Set mode to deny_only
-        await this.setMode("deny_only", true);
-      }
-    } catch (error) {
-      if (error instanceof Error) {
-        throw error;
-      }
-      throw new Error(
-        `Failed to sync settings with Geo agent: ${error instanceof Error ? error.message : "Unknown error"}`
-      );
+    if (!domain || !domain.trim()) {
+      throw new Error("A domain is required to sync geo access settings.");
     }
+
+    const target = domain.trim().toLowerCase();
+    const currentStatus = await this.getStatus(target);
+
+    /** Bring a list to exactly `desired`, removing extras and adding the rest. */
+    const reconcile = async (
+      current: string[],
+      desired: string[],
+      add: (country: string) => Promise<unknown>,
+      remove: (country: string) => Promise<unknown>
+    ): Promise<void> => {
+      const currentSet = new Set(current);
+      const desiredSet = new Set(desired);
+
+      for (const country of currentSet) {
+        if (!desiredSet.has(country)) await remove(country);
+      }
+      for (const country of desiredSet) {
+        if (!currentSet.has(country)) await add(country);
+      }
+    };
+
+    const clearAllow = () =>
+      reconcile(
+        currentStatus.allow,
+        [],
+        (c) => this.addAllowCountry(target, c),
+        (c) => this.removeAllowCountry(target, c, true)
+      );
+
+    const clearDeny = () =>
+      reconcile(
+        currentStatus.deny,
+        [],
+        (c) => this.addDenyCountry(target, c),
+        (c) => this.removeDenyCountry(target, c)
+      );
+
+    if (mode === "allow-all") {
+      // deny_only with an empty deny list blocks nobody.
+      await clearDeny();
+      await clearAllow();
+      await this.setMode(target, "deny_only", true);
+      return;
+    }
+
+    if (mode === "allow-only") {
+      // Lists first, then the mode, so the agent never sits in allow_only with
+      // an empty allow list -- which would block every visitor.
+      await clearDeny();
+      await reconcile(
+        currentStatus.allow,
+        allowedCountries,
+        (c) => this.addAllowCountry(target, c),
+        (c) => this.removeAllowCountry(target, c, true)
+      );
+      await this.setMode(target, "allow_only", allowedCountries.length === 0);
+      return;
+    }
+
+    if (mode === "ban-specific") {
+      await clearAllow();
+      await reconcile(
+        currentStatus.deny,
+        deniedCountries,
+        (c) => this.addDenyCountry(target, c),
+        (c) => this.removeDenyCountry(target, c)
+      );
+      await this.setMode(target, "deny_only", true);
+      return;
+    }
+
+    throw new Error(`Unknown geo access mode: ${mode}`);
   }
 
   /**
