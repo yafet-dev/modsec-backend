@@ -1,4 +1,5 @@
 import { PRIVATE_IP_RANGES, LOCALHOST_IPS } from "../constants/ipRanges";
+import geoip from "geoip-lite";
 
 export interface IPLocation {
   country: string;
@@ -181,6 +182,55 @@ export async function getLocationsFromIPs(ips: string[]): Promise<Map<string, IP
     if (i + BATCH_SIZE < uncachedIPs.length) {
       await new Promise(resolve => setTimeout(resolve, BATCH_DELAY));
     }
+  }
+
+  return results;
+}
+
+/**
+ * Resolve many IPs locally for latency-sensitive aggregate views.
+ *
+ * The interactive attack map must not wait seconds (or minutes) for a remote
+ * request per unique address. `geoip-lite` is already bundled and used by the
+ * reporting pipeline, so this path performs no network I/O and has no rate
+ * limit sleeps. Unknown/reserved addresses keep the same neutral fallback the
+ * old endpoint used.
+ */
+export function getLocalLocationsFromIPs(
+  ips: string[]
+): Map<string, IPLocation> {
+  const results = new Map<string, IPLocation>();
+  const displayNames = new Intl.DisplayNames(["en"], { type: "region" });
+
+  for (const rawIp of new Set(ips)) {
+    const ip = rawIp.trim();
+    if (!ip) continue;
+
+    if (isPrivateIP(ip)) {
+      results.set(ip, { country: "Local", lat: 0, lng: 0 });
+      continue;
+    }
+
+    const lookup = geoip.lookup(ip);
+    if (!lookup) {
+      results.set(ip, { country: "Unknown", lat: 20, lng: 0 });
+      continue;
+    }
+
+    let country = lookup.country;
+    try {
+      country = displayNames.of(lookup.country) || lookup.country;
+    } catch {
+      // Keep the ISO code if this Node runtime cannot display the region.
+    }
+
+    const [lat, lng] = lookup.ll;
+    results.set(ip, {
+      country,
+      countryCode: lookup.country,
+      lat: Number.isFinite(lat) ? lat : 20,
+      lng: Number.isFinite(lng) ? lng : 0,
+    });
   }
 
   return results;

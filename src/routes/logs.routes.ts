@@ -1,10 +1,70 @@
 import { Router, Request, Response } from "express";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { supabase } from "../lib/supabase";
-import { getLocationsFromIPs } from "../utils/ipGeolocation";
+import { getLocalLocationsFromIPs } from "../utils/ipGeolocation";
 import { buildHostCondition } from "../utils/hostFilter";
+import {
+  type AnalyticsAggregateRow,
+  buildLogAnalyticsResponse,
+  getAnalyticsWindow,
+  parseAnalyticsRange,
+} from "../services/logAnalytics";
+import {
+  type AttackOrigin,
+  aggregateAttackOrigins,
+} from "../services/attackOrigins";
 
 const router = Router();
+
+const ATTACK_ORIGINS_CACHE_TTL_MS = 60 * 1000;
+const ATTACK_ORIGINS_CACHE_MAX_ENTRIES = 100;
+const ATTACK_ORIGINS_WINDOW_DAYS = 30;
+const ATTACK_ORIGINS_WINDOW_MS =
+  ATTACK_ORIGINS_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+const attackOriginsCache = new Map<
+  string,
+  { expiresAt: number; origins: AttackOrigin[] }
+>();
+const attackOriginsInFlight = new Map<string, Promise<AttackOrigin[]>>();
+
+function normalizedHost(value?: string): string {
+  return (value ?? "").trim().toLowerCase().replace(/\.+$/, "");
+}
+
+function attackOriginsCacheKey(
+  currentUser: {
+    role: string | null;
+    memberships: { organizationId: string }[];
+  },
+  host?: string
+): string {
+  const accessKey =
+    currentUser.role === "super_admin"
+      ? "super-admin:all"
+      : `organizations:${currentUser.memberships
+          .map((membership) => membership.organizationId)
+          .sort()
+          .join(",")}`;
+  return `${accessKey}|host:${normalizedHost(host) || "all"}`;
+}
+
+function cacheAttackOrigins(key: string, origins: AttackOrigin[]): void {
+  const now = Date.now();
+  for (const [cacheKey, entry] of attackOriginsCache) {
+    if (entry.expiresAt <= now) attackOriginsCache.delete(cacheKey);
+  }
+
+  if (attackOriginsCache.size >= ATTACK_ORIGINS_CACHE_MAX_ENTRIES) {
+    const oldestKey = attackOriginsCache.keys().next().value;
+    if (oldestKey) attackOriginsCache.delete(oldestKey);
+  }
+
+  attackOriginsCache.set(key, {
+    origins,
+    expiresAt: now + ATTACK_ORIGINS_CACHE_TTL_MS,
+  });
+}
 
 /**
  * Restrict a query to the logs a user is allowed to see.
@@ -370,7 +430,10 @@ router.get("/hosts", async (req: Request, res: Response) => {
       select: {
         id: true,
         role: true,
-        memberships: { select: { organizationId: true } },
+        memberships: {
+          where: { status: "verified" },
+          select: { organizationId: true },
+        },
       },
     });
 
@@ -402,6 +465,138 @@ router.get("/hosts", async (req: Request, res: Response) => {
     console.error("Error fetching log hosts:", error);
     res.status(500).json({
       message: "Failed to fetch log hosts",
+      error: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/logs/analytics:
+ *   get:
+ *     summary: Get range-aware overview metrics and attack trend buckets
+ *     tags: [Logs]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: range
+ *         schema:
+ *           type: string
+ *           enum: [24h, 7d, 30d, 3m]
+ *           default: 24h
+ *       - in: query
+ *         name: host
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Aggregated metrics and zero-filled time buckets
+ *       401:
+ *         description: Unauthorized
+ *       500:
+ *         description: Server error
+ */
+router.get("/analytics", async (req: Request, res: Response) => {
+  try {
+    const token = req.headers.authorization?.replace("Bearer ", "");
+    if (!token) {
+      return res.status(401).json({ message: "No token provided" });
+    }
+
+    const {
+      data: { user: supabaseUser },
+      error,
+    } = await supabase.auth.getUser(token);
+
+    if (error || !supabaseUser) {
+      return res.status(401).json({ message: "Invalid or expired token" });
+    }
+
+    const currentUser = await prisma.user.findUnique({
+      where: { email: supabaseUser.email! },
+      include: {
+        memberships: {
+          where: { status: "verified" },
+          select: { organizationId: true },
+        },
+      },
+    });
+
+    if (!currentUser) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const range = parseAnalyticsRange(req.query.range);
+    const window = getAnalyticsWindow(range);
+    const scope = buildAccessScope(currentUser);
+
+    if (scope === null) {
+      return res.json(buildLogAnalyticsResponse(range, window, []));
+    }
+
+    const startTimestamp = window.start.toISOString().replace(/Z$/, "");
+    const endTimestamp = window.end.toISOString().replace(/Z$/, "");
+    const bucketSizeSeconds = window.bucketSizeMs / 1000;
+    const conditions: Prisma.Sql[] = [
+      Prisma.sql`"timestamp" >= ${startTimestamp}::timestamp`,
+      Prisma.sql`"timestamp" < ${endTimestamp}::timestamp`,
+    ];
+
+    if (currentUser.role !== "super_admin") {
+      const organizationIds = currentUser.memberships.map(
+        (membership) => membership.organizationId
+      );
+      conditions.push(
+        Prisma.sql`"organizationId" IN (${Prisma.join(organizationIds)})`
+      );
+    }
+
+    const host = normalizedHost(req.query.host as string | undefined);
+    if (host) {
+      conditions.push(Prisma.sql`LOWER("host") = ${host}`);
+    }
+
+    // Aggregate inside PostgreSQL so a dashboard response is at most 30 rows,
+    // regardless of whether the selected period contains 100 or 10M events.
+    const rows = await prisma.$queryRaw<AnalyticsAggregateRow[]>(Prisma.sql`
+      SELECT
+        FLOOR(
+          EXTRACT(
+            EPOCH FROM ("timestamp" - ${startTimestamp}::timestamp)
+          )
+          / ${bucketSizeSeconds}
+        )::integer AS "bucketIndex",
+        COUNT(*) AS "attacks",
+        COUNT(*) FILTER (
+          WHERE LOWER("action") = 'blocked'
+        ) AS "blocked",
+        COUNT(*) FILTER (
+          WHERE UPPER("severity") = 'CRITICAL'
+        ) AS "critical",
+        COUNT(*) FILTER (
+          WHERE UPPER("severity") = 'HIGH'
+        ) AS "high",
+        COUNT(*) FILTER (
+          WHERE UPPER("severity") = 'MEDIUM'
+        ) AS "medium",
+        COUNT(*) FILTER (
+          WHERE UPPER("severity") = 'LOW'
+        ) AS "low"
+      FROM "Log"
+      WHERE ${Prisma.join(conditions, " AND ")}
+      GROUP BY 1
+      ORDER BY 1
+    `);
+
+    // React Query owns the short client cache. Do not let a browser HTTP cache
+    // replay authenticated tenant data after an account switch.
+    res.setHeader("Cache-Control", "private, no-store");
+    res.json(buildLogAnalyticsResponse(range, window, rows));
+  } catch (error) {
+    console.error("Error fetching log analytics:", error);
+    res.status(500).json({
+      message: "Failed to fetch log analytics",
       error: error instanceof Error ? error.message : "Unknown error",
     });
   }
@@ -444,28 +639,33 @@ router.get("/hosts", async (req: Request, res: Response) => {
  *                         type: string
  *                       country:
  *                         type: string
+ *                       countryCode:
+ *                         type: string
  *                       lat:
  *                         type: number
  *                       lng:
  *                         type: number
  *                       count:
  *                         type: integer
+ *                       ipCount:
+ *                         type: integer
  *                       severity:
  *                         type: string
  *                         enum: [high, medium, low]
+ *                 windowDays:
+ *                   type: integer
+ *                   example: 30
  *       401:
  *         description: Unauthorized
  *       500:
  *         description: Server error
  */
 router.get("/attack-origins", async (req: Request, res: Response) => {
-  console.log("[Attack Origins] Endpoint hit - /api/logs/attack-origins");
   try {
     const authHeader = req.headers.authorization;
     const token = authHeader?.replace("Bearer ", "");
 
     if (!token) {
-      console.log("[Attack Origins] No token provided");
       return res.status(401).json({
         message: "No token provided",
       });
@@ -504,178 +704,77 @@ router.get("/attack-origins", async (req: Request, res: Response) => {
       });
     }
 
-    const hostFilter = req.query.host as string | undefined;
-    const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
+    const hostFilter = normalizedHost(req.query.host as string | undefined);
+    const requestedLimit = Number.parseInt(req.query.limit as string, 10);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.max(1, Math.min(requestedLimit, 100))
+      : 50;
 
-    // Build where clause
-    const where: any = {};
-
-    // For super_admin: show all logs (or filter by host if provided)
-    // For regular users: only show logs from their organizations
-    if (currentUser.role === "super_admin") {
-      // Show all logs
-    } else {
-      // Regular user: only show logs from their organizations
-      const userOrganizationIds = currentUser.memberships.map(
-        (m) => m.organizationId
-      );
-
-      if (userOrganizationIds.length === 0) {
-        return res.json({ origins: [] });
-      }
-
-      where.organizationId = {
-        in: userOrganizationIds,
-      };
+    const scope = buildAccessScope(currentUser);
+    if (scope === null) {
+      return res.json({ origins: [], windowDays: ATTACK_ORIGINS_WINDOW_DAYS });
     }
 
-    // Apply host filter (matches the host and its subdomains, nothing else)
+    const where: any = { ...scope };
+
+    // Apply the same exact, case-insensitive host rule as the log table.
     if (hostFilter) {
       where.AND = [buildHostCondition(hostFilter)];
     }
 
-    // Fetch all logs (no time filter - show all attack origins)
-    // Use a large limit to ensure we get all logs, or remove limit entirely
-    const logs = await prisma.log.findMany({
-      where,
-      select: {
-        clientIp: true,
-        severity: true,
-        timestamp: true,
-      },
-      orderBy: {
-        timestamp: 'desc', // Get most recent logs first
-      },
-      // Remove any implicit limits - get ALL logs
-    });
+    // A geographic dashboard is useful for current attack activity, not an
+    // ever-growing all-time archive. Bounding the window also keeps cold-cache
+    // aggregation fast as the log table grows.
+    const windowEnd = new Date();
+    where.timestamp = {
+      gte: new Date(windowEnd.getTime() - ATTACK_ORIGINS_WINDOW_MS),
+      lt: windowEnd,
+    };
 
-    console.log(`[Attack Origins] Fetched ${logs.length} logs from database`);
+    const cacheKey = attackOriginsCacheKey(currentUser, hostFilter);
+    const cached = attackOriginsCache.get(cacheKey);
+    let origins: AttackOrigin[];
 
-    // Group by country and calculate stats
-    const countryMap = new Map<
-      string,
-      {
-        count: number;
-        severities: string[];
-        lat: number;
-        lng: number;
-        sampleIp: string;
-        allIps: Set<string>; // Track all IPs for debugging
-      }
-    >();
+    if (cached && cached.expiresAt > Date.now()) {
+      origins = cached.origins;
+    } else {
+      let pending = attackOriginsInFlight.get(cacheKey);
 
-    // Process ALL logs and their clientIp values
-    let processedCount = 0;
-    let skippedCount = 0;
-    
-    // Extract all unique IPs first
-    const uniqueIPs = new Set<string>();
-    const ipToLogs = new Map<string, typeof logs>();
-    
-    for (const log of logs) {
-      const ip = log.clientIp;
-      
-      // Skip if IP is null or empty
-      if (!ip || ip.trim() === '') {
-        skippedCount++;
-        continue;
-      }
+      if (!pending) {
+        pending = (async () => {
+          // The database returns one compact row per IP/severity combination.
+          // This replaces loading, sorting, and walking every historical log.
+          const groupedLogs = await prisma.log.groupBy({
+            by: ["clientIp", "severity"],
+            where,
+            _count: { _all: true },
+          });
+          const locations = getLocalLocationsFromIPs(
+            groupedLogs.map((row) => row.clientIp)
+          );
+          return aggregateAttackOrigins(groupedLogs, locations);
+        })();
 
-      uniqueIPs.add(ip);
-      if (!ipToLogs.has(ip)) {
-        ipToLogs.set(ip, []);
-      }
-      ipToLogs.get(ip)!.push(log);
-    }
-
-    console.log(`[Attack Origins] Found ${uniqueIPs.size} unique IPs to geolocate`);
-
-    // Batch geolocate all IPs using the API
-    const ipLocations = await getLocationsFromIPs(Array.from(uniqueIPs));
-
-    // Process logs with their geolocated data
-    for (const log of logs) {
-      const ip = log.clientIp;
-      
-      // Skip if IP is null or empty
-      if (!ip || ip.trim() === '') {
-        continue;
-      }
-
-      const location = ipLocations.get(ip);
-      if (!location) {
-        console.warn(`[Attack Origins] No location found for IP: ${ip}`);
-        continue;
-      }
-
-      const country = location.country;
-
-      // Debug logging for UK IPs specifically
-      if (ip === '194.88.100.170' || country === 'United Kingdom' || country === 'GB') {
-        console.log(`[Attack Origins] Processing UK IP: ${ip}, Country: ${country}, Lat: ${location.lat}, Lng: ${location.lng}`);
-      }
-
-      if (!countryMap.has(country)) {
-        countryMap.set(country, {
-          count: 0,
-          severities: [],
-          lat: location.lat,
-          lng: location.lng,
-          sampleIp: ip,
-          allIps: new Set(),
-        });
-      }
-      const entry = countryMap.get(country)!;
-      entry.count++;
-      entry.severities.push(log.severity);
-      entry.allIps.add(ip); // Track this IP
-      processedCount++;
-    }
-    
-    console.log(`[Attack Origins] Processed ${processedCount} logs, skipped ${skippedCount} empty IPs`);
-
-    console.log(`[Attack Origins] Grouped into ${countryMap.size} countries`);
-    console.log(`[Attack Origins] Countries found:`, Array.from(countryMap.keys()));
-    
-    // Log details for each country to help debug
-    countryMap.forEach((data, country) => {
-      const ipList = Array.from(data.allIps).slice(0, 5);
-      console.log(`[Attack Origins] Country: "${country}", Count: ${data.count}, Sample IPs: ${ipList.join(', ')}${data.allIps.size > 5 ? ` (+${data.allIps.size - 5} more)` : ''}`);
-    });
-
-    // Convert to array and calculate severity
-    const origins = Array.from(countryMap.entries())
-      .map(([country, data]) => {
-        // Determine overall severity (highest severity from logs)
-        const hasCritical = data.severities.some((s) => s === "CRITICAL");
-        const hasHigh = data.severities.some((s) => s === "HIGH");
-        const hasMedium = data.severities.some((s) => s === "MEDIUM");
-
-        let severity: "high" | "medium" | "low" = "low";
-        if (hasCritical || hasHigh) {
-          severity = "high";
-        } else if (hasMedium) {
-          severity = "medium";
-        }
-
-        return {
-          ip: data.sampleIp, // Keep IP for reference, but data is grouped by country
-          country: country,
-          lat: data.lat,
-          lng: data.lng,
-          count: data.count,
-          severity,
+        attackOriginsInFlight.set(cacheKey, pending);
+        const clearPending = () => {
+          if (attackOriginsInFlight.get(cacheKey) === pending) {
+            attackOriginsInFlight.delete(cacheKey);
+          }
         };
-      })
-      .filter((origin) => {
-        // Filter out local IPs only (they have country "Local" and coordinates 0,0)
-        // Keep "Unknown" countries and all other countries
-        return origin.country !== "Local";
-      })
-      .sort((a, b) => b.count - a.count) // Sort by count descending
-      .slice(0, limit);
+        pending.then(clearPending, clearPending);
+      }
 
-    res.json({ origins });
+      origins = await pending;
+      cacheAttackOrigins(cacheKey, origins);
+    }
+
+    // The scoped server cache above provides the speed-up; authenticated
+    // responses themselves must not be reusable by a browser after logout.
+    res.setHeader("Cache-Control", "private, no-store");
+    res.json({
+      origins: origins.slice(0, limit),
+      windowDays: ATTACK_ORIGINS_WINDOW_DAYS,
+    });
   } catch (error) {
     console.error("Error fetching attack origins:", error);
     res.status(500).json({
