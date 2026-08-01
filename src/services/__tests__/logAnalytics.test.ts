@@ -161,6 +161,8 @@ test("database weights are preserved above 100 and blocked plus allowed equals a
 
   assert.equal(response.summary.totalRequests, 205);
   assert.equal(response.summary.blockedAttacks, 45);
+  assert.equal(response.summary.allowedRequests, 160);
+  assert.equal(response.summary.topRule, null);
   assert.equal(response.series[0].allowed, 100);
   assert.equal(response.series[1].allowed, 60);
 
@@ -187,6 +189,7 @@ test("invalid bucket rows cannot affect the series, totals, or threat level", ()
 
   assert.equal(response.summary.totalRequests, 3);
   assert.equal(response.summary.blockedAttacks, 2);
+  assert.equal(response.summary.allowedRequests, 1);
   assert.equal(response.summary.threatLevel, "Low");
   assert.deepEqual(response.series[0], {
     timestamp: window.start.toISOString(),
@@ -198,6 +201,43 @@ test("invalid bucket rows cannot affect the series, totals, or threat level", ()
     response.series.slice(1).every((point) => point.attacks === 0),
     true
   );
+});
+
+test("empty analytics defaults allowed requests to zero and top rule to null", () => {
+  const window = getAnalyticsWindow(
+    "24h",
+    new Date("2026-07-31T12:00:00.000Z")
+  );
+  const response = buildLogAnalyticsResponse("24h", window, []);
+
+  assert.deepEqual(response.summary, {
+    totalRequests: 0,
+    blockedAttacks: 0,
+    allowedRequests: 0,
+    threatLevel: "Low",
+    topRule: null,
+  });
+});
+
+test("analytics includes the supplied top rule in its summary", () => {
+  const window = getAnalyticsWindow(
+    "24h",
+    new Date("2026-07-31T12:00:00.000Z")
+  );
+  const topRule = {
+    ruleId: "942100",
+    ruleName: "SQL Injection Attack Detected",
+    count: 37,
+  };
+  const response = buildLogAnalyticsResponse(
+    "24h",
+    window,
+    [row(0, 10, 4, { high: 2, low: 8 })],
+    topRule
+  );
+
+  assert.equal(response.summary.allowedRequests, 6);
+  assert.deepEqual(response.summary.topRule, topRule);
 });
 
 test("threat levels honor simple, compound, and exact boundary thresholds", () => {

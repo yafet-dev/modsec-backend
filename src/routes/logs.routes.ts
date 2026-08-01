@@ -6,6 +6,7 @@ import { getLocalLocationsFromIPs } from "../utils/ipGeolocation";
 import { buildHostCondition } from "../utils/hostFilter";
 import {
   type AnalyticsAggregateRow,
+  type AnalyticsTopRule,
   buildLogAnalyticsResponse,
   getAnalyticsWindow,
   parseAnalyticsRange,
@@ -14,8 +15,20 @@ import {
   type AttackOrigin,
   aggregateAttackOrigins,
 } from "../services/attackOrigins";
+import {
+  normalizeModsecHostname,
+  selectPendingLandingSummary,
+} from "../services/modsecLandingSummary";
+import { getCachedPendingLandingSnapshot } from "../services/modsecLandingStatus";
+import { modsecCronScheduler } from "../services/modsecCronScheduler";
 
 const router = Router();
+
+interface AnalyticsTopRuleAggregateRow {
+  ruleId: string;
+  ruleName: string;
+  count: number | bigint;
+}
 
 const ATTACK_ORIGINS_CACHE_TTL_MS = 60 * 1000;
 const ATTACK_ORIGINS_CACHE_MAX_ENTRIES = 100;
@@ -559,40 +572,71 @@ router.get("/analytics", async (req: Request, res: Response) => {
 
     // Aggregate inside PostgreSQL so a dashboard response is at most 30 rows,
     // regardless of whether the selected period contains 100 or 10M events.
-    const rows = await prisma.$queryRaw<AnalyticsAggregateRow[]>(Prisma.sql`
-      SELECT
-        FLOOR(
-          EXTRACT(
-            EPOCH FROM ("timestamp" - ${startTimestamp}::timestamp)
-          )
-          / ${bucketSizeSeconds}
-        )::integer AS "bucketIndex",
-        COUNT(*) AS "attacks",
-        COUNT(*) FILTER (
-          WHERE LOWER("action") = 'blocked'
-        ) AS "blocked",
-        COUNT(*) FILTER (
-          WHERE UPPER("severity") = 'CRITICAL'
-        ) AS "critical",
-        COUNT(*) FILTER (
-          WHERE UPPER("severity") = 'HIGH'
-        ) AS "high",
-        COUNT(*) FILTER (
-          WHERE UPPER("severity") = 'MEDIUM'
-        ) AS "medium",
-        COUNT(*) FILTER (
-          WHERE UPPER("severity") = 'LOW'
-        ) AS "low"
-      FROM "Log"
-      WHERE ${Prisma.join(conditions, " AND ")}
-      GROUP BY 1
-      ORDER BY 1
-    `);
+    const [rows, topRuleRows] = await Promise.all([
+      prisma.$queryRaw<AnalyticsAggregateRow[]>(Prisma.sql`
+        SELECT
+          FLOOR(
+            EXTRACT(
+              EPOCH FROM ("timestamp" - ${startTimestamp}::timestamp)
+            )
+            / ${bucketSizeSeconds}
+          )::integer AS "bucketIndex",
+          COUNT(*) AS "attacks",
+          COUNT(*) FILTER (
+            WHERE LOWER("action") = 'blocked'
+          ) AS "blocked",
+          COUNT(*) FILTER (
+            WHERE UPPER("severity") = 'CRITICAL'
+          ) AS "critical",
+          COUNT(*) FILTER (
+            WHERE UPPER("severity") = 'HIGH'
+          ) AS "high",
+          COUNT(*) FILTER (
+            WHERE UPPER("severity") = 'MEDIUM'
+          ) AS "medium",
+          COUNT(*) FILTER (
+            WHERE UPPER("severity") = 'LOW'
+          ) AS "low"
+        FROM "Log"
+        WHERE ${Prisma.join(conditions, " AND ")}
+        GROUP BY 1
+        ORDER BY 1
+      `),
+      prisma.$queryRaw<AnalyticsTopRuleAggregateRow[]>(Prisma.sql`
+        SELECT
+          BTRIM("ruleId") AS "ruleId",
+          COALESCE(
+            MIN(NULLIF(BTRIM("rule"), '')) FILTER (
+              WHERE "rule" IS NOT NULL
+                AND LOWER(BTRIM("rule")) <> 'unknown rule'
+            ),
+            'Rule ' || BTRIM("ruleId")
+          ) AS "ruleName",
+          COUNT(*) AS "count"
+        FROM "Log"
+        WHERE ${Prisma.join(conditions, " AND ")}
+          AND "ruleId" IS NOT NULL
+          AND BTRIM("ruleId") <> ''
+          AND BTRIM("ruleId") <> '-'
+        GROUP BY BTRIM("ruleId")
+        ORDER BY COUNT(*) DESC, BTRIM("ruleId") ASC
+        LIMIT 1
+      `),
+    ]);
+
+    const topRuleRow = topRuleRows[0];
+    const topRule: AnalyticsTopRule | null = topRuleRow
+      ? {
+          ruleId: topRuleRow.ruleId,
+          ruleName: topRuleRow.ruleName,
+          count: Number(topRuleRow.count),
+        }
+      : null;
 
     // React Query owns the short client cache. Do not let a browser HTTP cache
     // replay authenticated tenant data after an account switch.
     res.setHeader("Cache-Control", "private, no-store");
-    res.json(buildLogAnalyticsResponse(range, window, rows));
+    res.json(buildLogAnalyticsResponse(range, window, rows, topRule));
   } catch (error) {
     console.error("Error fetching log analytics:", error);
     res.status(500).json({
@@ -779,6 +823,149 @@ router.get("/attack-origins", async (req: Request, res: Response) => {
     console.error("Error fetching attack origins:", error);
     res.status(500).json({
       message: "Failed to fetch attack origins",
+      error: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/logs/processing-status:
+ *   get:
+ *     summary: Get the caller's pending ModSecurity ingestion status
+ *     description: >
+ *       Counts only raw landing records whose processed flag is exactly false.
+ *       Regular users see records whose normalized host exactly matches a
+ *       domain on one of their verified, active organizations. Raw landing
+ *       payloads are never returned.
+ *     tags: [Logs]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: host
+ *         schema:
+ *           type: string
+ *         description: Optional exact normalized host filter
+ *     responses:
+ *       200:
+ *         description: Tenant-scoped pending ingestion status
+ *       400:
+ *         description: Invalid host filter
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Host is outside the caller's organizations
+ *       500:
+ *         description: Server error
+ */
+router.get("/processing-status", async (req: Request, res: Response) => {
+  try {
+    const token = req.headers.authorization?.replace("Bearer ", "");
+    if (!token) {
+      return res.status(401).json({ message: "No token provided" });
+    }
+
+    const {
+      data: { user: supabaseUser },
+      error,
+    } = await supabase.auth.getUser(token);
+
+    if (error || !supabaseUser) {
+      return res.status(401).json({ message: "Invalid or expired token" });
+    }
+
+    const currentUser = await prisma.user.findUnique({
+      where: { email: supabaseUser.email! },
+      select: {
+        role: true,
+        memberships: {
+          where: { status: "verified" },
+          select: {
+            organization: {
+              select: {
+                status: true,
+                domains: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!currentUser) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    res.setHeader("Cache-Control", "private, no-store");
+
+    const hostQuery = req.query.host;
+    let requestedHost: string | undefined;
+    if (hostQuery !== undefined) {
+      if (typeof hostQuery !== "string") {
+        return res.status(400).json({ message: "Host must be a single value" });
+      }
+
+      const normalized = normalizeModsecHostname(hostQuery);
+      if (!normalized) {
+        return res.status(400).json({ message: "Host is invalid" });
+      }
+      requestedHost = normalized;
+    }
+
+    const isSuperAdmin = currentUser.role === "super_admin";
+    let allowedHosts: Set<string> | null = null;
+
+    if (!isSuperAdmin) {
+      allowedHosts = new Set<string>();
+      for (const membership of currentUser.memberships) {
+        if (membership.organization.status !== "active") continue;
+
+        for (const domain of membership.organization.domains) {
+          const normalized = normalizeModsecHostname(domain);
+          if (normalized) allowedHosts.add(normalized);
+        }
+      }
+
+      if (requestedHost && !allowedHosts.has(requestedHost)) {
+        return res.status(403).json({
+          message: "Forbidden: host is outside your active organizations",
+        });
+      }
+    }
+
+    let pendingCount = 0;
+    let oldestPendingAt: Date | null = null;
+    let checkedAt = new Date();
+
+    // A regular user without an active registered domain cannot own any raw
+    // landing record. Avoid scanning the global queue in that case.
+    if (allowedHosts === null || allowedHosts.size > 0) {
+      const snapshot = await getCachedPendingLandingSnapshot();
+      const selected = selectPendingLandingSummary(snapshot, {
+        allowedHosts,
+        host: requestedHost,
+      });
+      pendingCount = selected.pendingCount;
+      oldestPendingAt = selected.oldestPendingAt;
+      checkedAt = snapshot.checkedAt;
+    }
+
+    const schedulerStatus = modsecCronScheduler.getStatus();
+
+    res.json({
+      pendingCount,
+      oldestPendingAt: oldestPendingAt?.toISOString() ?? null,
+      checkedAt: checkedAt.toISOString(),
+      // This singleton only observes the in-process cron. Gate the advisory
+      // flag by the caller-visible queue so it cannot reveal another tenant's
+      // processing activity.
+      isProcessing: pendingCount > 0 && schedulerStatus.isProcessing,
+    });
+  } catch (error) {
+    console.error("Error fetching pending ModSecurity status:", error);
+    res.status(500).json({
+      message: "Failed to fetch processing status",
       error: error instanceof Error ? error.message : "Unknown error",
     });
   }

@@ -200,6 +200,144 @@ router.get("/my-organization", async (req: Request, res: Response) => {
 
 /**
  * @swagger
+ * /api/organization-members/{memberId}:
+ *   delete:
+ *     summary: Remove a member from the requester's organization
+ *     tags: [Organization Members]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: memberId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Organization membership ID
+ *     responses:
+ *       200:
+ *         description: Member removed successfully
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden
+ *       404:
+ *         description: Membership not found
+ *       500:
+ *         description: Server error
+ */
+router.delete("/:memberId", async (req: Request, res: Response) => {
+  try {
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.startsWith("Bearer ")
+      ? authHeader.slice("Bearer ".length).trim()
+      : undefined;
+
+    if (!token) {
+      return res.status(401).json({ message: "No token provided" });
+    }
+
+    const {
+      data: { user: supabaseUser },
+      error,
+    } = await supabase.auth.getUser(token);
+
+    if (error || !supabaseUser) {
+      return res.status(401).json({ message: "Invalid or expired token" });
+    }
+
+    const identityFilters: Prisma.UserWhereInput[] = [
+      { authUserId: supabaseUser.id },
+    ];
+    if (supabaseUser.email) {
+      identityFilters.push({
+        authUserId: null,
+        email: normalizeEmail(supabaseUser.email),
+      });
+    }
+
+    const currentUser = await prisma.user.findFirst({
+      where: { OR: identityFilters },
+      select: { id: true },
+    });
+
+    if (!currentUser) {
+      return res.status(403).json({
+        message: "You are not authorized to delete organization members",
+      });
+    }
+
+    const deletionResult = await prisma.$transaction(async (tx) => {
+      const targetMembership = await tx.organizationMember.findUnique({
+        where: { id: req.params.memberId },
+        select: {
+          id: true,
+          userId: true,
+          organizationId: true,
+        },
+      });
+
+      if (!targetMembership) {
+        return {
+          status: 404 as const,
+          message: "Organization member not found",
+        };
+      }
+
+      const requesterMembership = await tx.organizationMember.findFirst({
+        where: {
+          userId: currentUser.id,
+          organizationId: targetMembership.organizationId,
+          role: "admin",
+          status: "verified",
+        },
+        select: { id: true },
+      });
+
+      if (!requesterMembership) {
+        return {
+          status: 403 as const,
+          message: "Only verified organization admins can delete this member",
+        };
+      }
+
+      if (targetMembership.userId === currentUser.id) {
+        return {
+          status: 403 as const,
+          message: "You cannot delete your own organization membership",
+        };
+      }
+
+      await tx.authEmailToken.deleteMany({
+        where: { organizationMemberId: targetMembership.id },
+      });
+      const deletedMembership = await tx.organizationMember.deleteMany({
+        where: { id: targetMembership.id },
+      });
+
+      if (deletedMembership.count === 0) {
+        return {
+          status: 404 as const,
+          message: "Organization member not found",
+        };
+      }
+
+      return {
+        status: 200 as const,
+        message: "User deleted successfully",
+      };
+    });
+
+    return res
+      .status(deletionResult.status)
+      .json({ message: deletionResult.message });
+  } catch (error) {
+    console.error("Error deleting organization member:", error);
+    return res.status(500).json({ message: "Failed to delete user" });
+  }
+});
+
+/**
+ * @swagger
  * /api/organization-members/{userId}/toggle-disabled:
  *   patch:
  *     summary: Toggle disabled status of a user

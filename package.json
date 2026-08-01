@@ -23,6 +23,7 @@
     "test:agent-policy": "tsx --test src/services/__tests__/agentCredentialPolicy.test.ts",
     "test:host-filter": "tsx --test src/services/__tests__/logHostFilter.test.ts",
     "test:analytics": "tsx --test src/services/__tests__/logAnalytics.test.ts src/services/__tests__/attackOrigins.test.ts",
+    "test:modsec-landing": "tsx --test src/services/__tests__/modsecLandingSummary.test.ts",
     "test:email-delivery": "tsx src/scripts/testEmailDeliveryMailTm.ts",
     "test:email-routes": "tsx src/scripts/testEmailRoutesMailTm.ts"
   },

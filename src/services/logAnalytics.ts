@@ -17,6 +17,12 @@ export interface AnalyticsAggregateRow {
   low: number | bigint;
 }
 
+export interface AnalyticsTopRule {
+  ruleId: string;
+  ruleName: string;
+  count: number;
+}
+
 export interface LogAnalyticsResponse {
   range: AnalyticsRange;
   start: string;
@@ -24,7 +30,9 @@ export interface LogAnalyticsResponse {
   summary: {
     totalRequests: number;
     blockedAttacks: number;
+    allowedRequests: number;
     threatLevel: "Low" | "Medium" | "High" | "Critical";
+    topRule: AnalyticsTopRule | null;
   };
   series: Array<{
     timestamp: string;
@@ -123,7 +131,8 @@ function toCount(value: number | bigint): number {
 export function buildLogAnalyticsResponse(
   range: AnalyticsRange,
   window: AnalyticsWindow,
-  rows: AnalyticsAggregateRow[]
+  rows: AnalyticsAggregateRow[],
+  topRule: AnalyticsTopRule | null = null
 ): LogAnalyticsResponse {
   const series = Array.from({ length: window.bucketCount }, (_, index) => ({
     timestamp: new Date(
@@ -154,6 +163,7 @@ export function buildLogAnalyticsResponse(
 
   const totalRequests = series.reduce((sum, point) => sum + point.attacks, 0);
   const blockedAttacks = series.reduce((sum, point) => sum + point.blocked, 0);
+  const allowedRequests = series.reduce((sum, point) => sum + point.allowed, 0);
 
   return {
     range,
@@ -162,10 +172,12 @@ export function buildLogAnalyticsResponse(
     summary: {
       totalRequests,
       blockedAttacks,
+      allowedRequests,
       threatLevel: calculateThreatLevel({
         total: totalRequests,
         ...severityCounts,
       }),
+      topRule,
     },
     series,
   };
