@@ -122,15 +122,19 @@ model DomainWAFStatus {
 }
 
 model ModsecLanding {
-  id        BigInt   @id @default(autoincrement()) @map("id")
-  tag       String?  @map("tag")
-  time      DateTime @default(now()) @map("time") @db.Timestamp(6)
-  data      Json     @map("data")
-  processed Boolean? @default(false) @map("processed")
+  id         BigInt   @id @default(autoincrement()) @map("id")
+  tag        String?  @map("tag")
+  time       DateTime @default(now()) @map("time") @db.Timestamp(6)
+  data       Json     @map("data")
+  processed  Boolean? @default(false) @map("processed")
+  /// Normalized request host maintained by a database trigger.
+  sourceHost String?  @map("source_host")
 
   @@index([processed])
   @@index([time])
   @@index([tag])
+  // The processed=false (source_host, time) and (id) partial indexes are
+  // migration-managed because Prisma cannot represent partial predicates.
   @@map("modsec_landing")
 }
 

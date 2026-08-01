@@ -246,7 +246,7 @@ router.get("/stats", async (req: Request, res: Response) => {
       processingRate: total > 0 ? ((processed / total) * 100).toFixed(2) : "0",
       cron: {
         enabled: process.env.ENABLE_MODSEC_CRON !== "false",
-        schedule: process.env.MODSEC_CRON_SCHEDULE || "*/5 * * * *",
+        schedule: process.env.MODSEC_CRON_SCHEDULE || "* * * * *",
         running: cronStatus.running,
         isProcessing: cronStatus.isProcessing,
       },

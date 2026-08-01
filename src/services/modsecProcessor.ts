@@ -1,5 +1,51 @@
+import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
+import { normalizeModsecHostname } from "../utils/modsecHostname";
 import { enrichSeverity } from "./severityEnrichment";
+
+const MAX_LANDING_BATCH_SIZE = 1_000;
+const TRANSACTION_MAX_WAIT_MS = 10_000;
+const BULK_TRANSACTION_TIMEOUT_MS = 60_000;
+const SINGLE_TRANSACTION_TIMEOUT_MS = 30_000;
+const FALLBACK_CONCURRENCY = 4;
+const ROW_LOCAL_BULK_ERROR_CODES = new Set([
+  "P2000", // value too long for a column
+  "P2004", // row-level database constraint
+  "P2005", // invalid stored value
+  "P2006", // invalid supplied value
+  "P2007", // data validation error
+  "P2011", // null constraint
+  "P2012", // missing required value
+  "P2019", // invalid input
+  "P2020", // value out of range
+]);
+
+interface ModsecLandingRecord {
+  id: bigint;
+  data: Prisma.JsonValue;
+  processed: boolean | null;
+}
+
+export interface ActiveOrganization {
+  id: string;
+  domains: string[];
+}
+
+interface PreparedLandingRecord {
+  landingId: bigint;
+  logData: Prisma.LogCreateManyInput;
+}
+
+interface LandingBatchResult {
+  claimed: number;
+  cursor: bigint | null;
+  processed: number;
+  failed: number;
+  errors: Array<{ id: string; error: string }>;
+  logIds: string[];
+}
+
+type OrganizationDomainIndex = Map<string, string | null>;
 
 /**
  * Sanitize string fields to prevent Unicode escape sequence issues
@@ -109,7 +155,7 @@ function sanitizeJson(obj: any): any {
   }
 }
 
-interface ModsecTransaction {
+export interface ModsecTransaction {
   transaction: {
     client_ip: string;
     client_port?: number;
@@ -153,6 +199,110 @@ interface ModsecTransaction {
       };
     }>;
   };
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function decodeJsonString(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch (firstError) {
+    // Keep compatibility with legacy Fluent Bit rows that wrapped JSON in
+    // quotes without encoding the outer value as valid JSON.
+    let candidate = value.trim();
+    if (
+      (candidate.startsWith('"') && candidate.endsWith('"')) ||
+      (candidate.startsWith("'") && candidate.endsWith("'"))
+    ) {
+      candidate = candidate.slice(1, -1);
+    }
+    candidate = candidate.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      throw firstError;
+    }
+  }
+}
+
+function unwrapLandingPayload(value: unknown, depth = 0): ModsecTransaction {
+  if (depth > 4) {
+    throw new Error("Landing data is nested too deeply");
+  }
+
+  if (typeof value === "string") {
+    return unwrapLandingPayload(decodeJsonString(value), depth + 1);
+  }
+
+  if (!isRecord(value)) {
+    throw new Error("Landing data must be a JSON object or encoded JSON string");
+  }
+
+  // Match the source-host database trigger's deterministic wrapper
+  // precedence. A malformed `raw` value is a malformed row; silently falling
+  // through to a second payload would make pending-host attribution disagree
+  // with the Log ultimately created by this processor.
+  if (typeof value.raw === "string") {
+    return unwrapLandingPayload(value.raw, depth + 1);
+  }
+  if (typeof value.data === "string") {
+    return unwrapLandingPayload(value.data, depth + 1);
+  }
+  if (isRecord(value.transaction)) {
+    return { transaction: value.transaction } as ModsecTransaction;
+  }
+  if (isRecord(value.data)) {
+    return unwrapLandingPayload(value.data, depth + 1);
+  }
+
+  // The remaining supported shape is the transaction object itself.
+  if (isRecord(value.request)) {
+    return { transaction: value } as ModsecTransaction;
+  }
+
+  throw new Error("Invalid transaction data structure - missing transaction");
+}
+
+/**
+ * Decode every ModsecLanding JSON shape accepted by the processor.
+ *
+ * Kept pure so ingestion-format changes can be covered without a database.
+ */
+export function parseModsecLandingData(data: Prisma.JsonValue): ModsecTransaction {
+  const parsed = unwrapLandingPayload(data);
+  if (!isRecord(parsed.transaction) || !isRecord(parsed.transaction.request)) {
+    throw new Error("Invalid transaction data structure - missing request");
+  }
+  return parsed;
+}
+
+function headerValue(
+  headers: Record<string, unknown> | undefined,
+  name: string
+): string | null {
+  if (!headers) return null;
+  const entry = Object.entries(headers).find(
+    ([key]) => key.toLowerCase() === name.toLowerCase()
+  );
+  return typeof entry?.[1] === "string" ? entry[1] : null;
+}
+
+/** Backwards-compatible export; source-host SQL and APIs use the same helper. */
+export const normalizeModsecHost = normalizeModsecHostname;
+
+export function extractModsecHost(transactionData: ModsecTransaction): string {
+  const request = transactionData.transaction.request;
+  const normalizedHostname = normalizeModsecHost(request.hostname);
+  const normalizedHostHeader = normalizeModsecHost(
+    headerValue(request.headers as Record<string, unknown> | undefined, "host")
+  );
+  const hostname = normalizedHostname === "unknown" ? null : normalizedHostname;
+  const hostHeader =
+    normalizedHostHeader === "unknown" ? null : normalizedHostHeader;
+  return hostname ?? hostHeader ?? "unknown";
 }
 
 /**
@@ -206,37 +356,53 @@ function parseTimestamp(timeStamp: string): Date {
   }
 }
 
-/**
- * Finds organization ID by matching host against organization domains
- * Returns the organization ID if a match is found, null otherwise
- */
-async function findOrganizationByHost(host: string): Promise<string | null> {
-  if (!host || host === 'unknown') {
-    return null;
+function buildOrganizationDomainIndex(
+  organizations: ActiveOrganization[]
+): OrganizationDomainIndex {
+  const index: OrganizationDomainIndex = new Map();
+
+  for (const organization of organizations) {
+    for (const rawDomain of organization.domains) {
+      const domain = normalizeModsecHost(rawDomain);
+      if (!domain || domain === "unknown") continue;
+
+      const existing = index.get(domain);
+      if (existing === undefined || existing === organization.id) {
+        index.set(domain, organization.id);
+      } else {
+        // A duplicate domain claim is ambiguous. Refusing attribution is safer
+        // than leaking one tenant's traffic into another tenant's Log rows.
+        index.set(domain, null);
+      }
+    }
   }
 
-  try {
-    // Normalize host: remove port if present, lowercase
-    const normalizedHost = host.split(':')[0].toLowerCase().trim();
+  return index;
+}
 
-    // Find organization where the host matches one of the domains
-    const organization = await prisma.organization.findFirst({
-      where: {
-        domains: {
-          has: normalizedHost,
-        },
-        status: 'active', // Only match active organizations
-      },
-      select: {
-        id: true,
-      },
-    });
+function resolveOrganizationFromIndex(
+  host: string,
+  index: OrganizationDomainIndex
+): string | null {
+  const normalizedHost = normalizeModsecHost(host);
+  if (!normalizedHost || normalizedHost === "unknown") return null;
+  return index.get(normalizedHost) ?? null;
+}
 
-    return organization?.id || null;
-  } catch (error) {
-    console.error(`Error finding organization for host ${host}:`, error);
-    return null;
-  }
+/** Pure organization-host resolver used by tests and the batch processor. */
+export function resolveOrganizationByHost(
+  host: string,
+  organizations: ActiveOrganization[]
+): string | null {
+  return resolveOrganizationFromIndex(host, buildOrganizationDomainIndex(organizations));
+}
+
+async function loadActiveOrganizationIndex(): Promise<OrganizationDomainIndex> {
+  const organizations = await prisma.organization.findMany({
+    where: { status: "active" },
+    select: { id: true, domains: true },
+  });
+  return buildOrganizationDomainIndex(organizations);
 }
 
 /**
@@ -250,11 +416,7 @@ export function transformModsecToLog(
   const firstMessage = transaction.messages?.[0];
   const details = firstMessage?.details;
 
-  // Extract host from hostname or headers
-  const host =
-    transaction.request.hostname ||
-    transaction.request.headers?.Host?.split(":")[0] ||
-    "unknown";
+  const host = extractModsecHost(transactionData);
 
   // Extract user agent
   const userAgent =
@@ -309,207 +471,346 @@ export function transformModsecToLog(
   return logEntry;
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Unknown error";
+}
+
+function shouldRetryBulkRowsIndividually(error: unknown): boolean {
+  return (
+    error instanceof Prisma.PrismaClientValidationError ||
+    (error instanceof Prisma.PrismaClientKnownRequestError &&
+      ROW_LOCAL_BULK_ERROR_CODES.has(error.code))
+  );
+}
+
+function prepareLandingRecord(
+  landing: ModsecLandingRecord,
+  organizationId: string | undefined,
+  organizationIndex: OrganizationDomainIndex
+): PreparedLandingRecord {
+  let transactionData: ModsecTransaction;
+  try {
+    transactionData = parseModsecLandingData(landing.data);
+  } catch (error) {
+    throw new Error(`Failed to parse transaction data: ${errorMessage(error)}`);
+  }
+
+  // Deep-clean before reading any nested request values. The same sanitized
+  // transaction then drives host attribution and the final Log row.
+  const sanitizedTransaction = sanitizeJson(transactionData) as
+    | ModsecTransaction
+    | null;
+  if (
+    !sanitizedTransaction?.transaction ||
+    !sanitizedTransaction.transaction.request
+  ) {
+    throw new Error("Failed to sanitize transaction data");
+  }
+
+  const host = extractModsecHost(sanitizedTransaction);
+  const finalOrganizationId =
+    organizationId ??
+    resolveOrganizationFromIndex(host, organizationIndex) ??
+    undefined;
+  const logEntry = transformModsecToLog(
+    sanitizedTransaction,
+    finalOrganizationId
+  );
+
+  try {
+    // Preserve the existing final JSON round trip: it normalizes Date values
+    // and catches values that Prisma's JSON serializer cannot persist.
+    const parsed = JSON.parse(JSON.stringify(logEntry));
+    const headers = parsed.headers ? sanitizeJson(parsed.headers) : null;
+    const responseHeader = parsed.responseHeader
+      ? sanitizeJson(parsed.responseHeader)
+      : null;
+    const logData: Prisma.LogCreateManyInput = {
+      ...parsed,
+      // Prisma distinguishes SQL NULL from a JSON `null` value. These columns
+      // are optional, so missing/sanitized-away payloads belong in SQL NULL.
+      headers: headers === null ? Prisma.DbNull : headers,
+      responseHeader:
+        responseHeader === null ? Prisma.DbNull : responseHeader,
+      rule: parsed.rule ? sanitizeString(parsed.rule) : null,
+      ruleId: parsed.ruleId ? sanitizeString(parsed.ruleId) : null,
+      userAgent: parsed.userAgent ? sanitizeString(parsed.userAgent) : null,
+      message: parsed.message ? sanitizeString(parsed.message) : null,
+      clientIp: parsed.clientIp || "0.0.0.0",
+      host: parsed.host || "unknown",
+      method: parsed.method || "GET",
+      requestUrl: parsed.requestUrl || "/",
+      action: parsed.action || "warning",
+      severity: parsed.severity || "LOW",
+    };
+
+    return { landingId: landing.id, logData };
+  } catch (error) {
+    throw new Error(`Failed to sanitize log entry: ${errorMessage(error)}`);
+  }
+}
+
+export function normalizeLandingBatchSize(value: number): number {
+  if (!Number.isFinite(value)) return 100;
+  return Math.max(1, Math.min(MAX_LANDING_BATCH_SIZE, Math.trunc(value)));
+}
+
+async function processLockedLandingRecord(
+  id: bigint,
+  organizationId: string | undefined,
+  organizationIndex: OrganizationDomainIndex
+): Promise<{ success: boolean; logId?: string; error?: string }> {
+  return prisma.$transaction(
+    async (tx) => {
+      const rows = await tx.$queryRaw<ModsecLandingRecord[]>(Prisma.sql`
+        SELECT "id", "data", "processed"
+        FROM "modsec_landing"
+        WHERE "id" = ${id}
+        FOR UPDATE
+      `);
+      const landing = rows[0];
+
+      if (!landing) {
+        return { success: false, error: "ModsecLanding record not found" };
+      }
+      if (landing.processed) {
+        return { success: false, error: "Record already processed" };
+      }
+      if (landing.processed !== false) {
+        return {
+          success: false,
+          error: "Record has no processable status (processed is null)",
+        };
+      }
+
+      const prepared = prepareLandingRecord(
+        landing,
+        organizationId,
+        organizationIndex
+      );
+      const log = await tx.log.create({ data: prepared.logData });
+      const updated = await tx.modsecLanding.updateMany({
+        where: { id, processed: false },
+        data: { processed: true },
+      });
+      if (updated.count !== 1) {
+        throw new Error("Landing record changed while it was being processed");
+      }
+
+      return { success: true, logId: log.id };
+    },
+    {
+      maxWait: TRANSACTION_MAX_WAIT_MS,
+      timeout: SINGLE_TRANSACTION_TIMEOUT_MS,
+    }
+  );
+}
+
 /**
- * Processes a single modsec_landing record and creates a Log entry
+ * Process one row under a database row lock. The Log insert and processed flag
+ * commit together, so concurrent API/cron/worker callers cannot duplicate it.
  */
 export async function processModsecLandingRecord(
   landingId: bigint | string,
   organizationId?: string
 ): Promise<{ success: boolean; logId?: string; error?: string }> {
   try {
-    // Convert string to BigInt if needed
-    const id = typeof landingId === 'string' ? BigInt(landingId) : landingId;
-    
-    // Fetch the modsec_landing record using id
-    const landing = await prisma.modsecLanding.findUnique({
-      where: {
-        id: id,
-      },
-    });
-
-    if (!landing) {
-      return { success: false, error: "ModsecLanding record not found" };
-    }
-
-    if (landing.processed) {
-      return { success: false, error: "Record already processed" };
-    }
-
-    // Parse the JSON data
-    // Fluent Bit stores data in different formats:
-    // 1. {"raw": "{\"transaction\":{...}}"} - raw JSON string
-    // 2. {"data": "{\"transaction\":{...}}"} - nested data field
-    // 3. {"transaction": {...}} - direct transaction
-    let transactionData: ModsecTransaction;
-    
-    try {
-      if (typeof landing.data === 'object' && landing.data !== null) {
-        const dataObj = landing.data as any;
-        let rawJsonText: string | null = null;
-        
-        // Try to extract raw JSON string (matching SQL script logic)
-        // SQL script does: raw_json_text := row_record.data->>'raw';
-        if (dataObj.raw && typeof dataObj.raw === 'string') {
-          rawJsonText = dataObj.raw;
-        } else if (dataObj.data && typeof dataObj.data === 'string') {
-          // Fluent Bit stores as {"data": "..."}
-          rawJsonText = dataObj.data;
-        } else if (typeof dataObj === 'string') {
-          // Sometimes the whole data field is a string
-          rawJsonText = dataObj as string;
-        }
-        
-        if (rawJsonText) {
-          // Parse the raw JSON string
-          try {
-            const parsedJson = JSON.parse(rawJsonText);
-            // Check if it has transaction directly or needs wrapping
-            if (parsedJson.transaction) {
-              transactionData = parsedJson as ModsecTransaction;
-            } else {
-              transactionData = { transaction: parsedJson } as ModsecTransaction;
-            }
-          } catch (parseError) {
-            // If parsing fails, try unescaping
-            let jsonString = rawJsonText;
-            // Remove surrounding quotes if present
-            if ((jsonString.startsWith('"') && jsonString.endsWith('"')) ||
-                (jsonString.startsWith("'") && jsonString.endsWith("'"))) {
-              jsonString = jsonString.slice(1, -1);
-            }
-            // Unescape common escape sequences
-            jsonString = jsonString.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-            const parsedJson = JSON.parse(jsonString);
-            transactionData = parsedJson.transaction 
-              ? parsedJson as ModsecTransaction
-              : { transaction: parsedJson } as ModsecTransaction;
-          }
-        } else if (dataObj.transaction) {
-          // Direct transaction object
-          transactionData = { transaction: dataObj.transaction } as ModsecTransaction;
-        } else if (dataObj.data && typeof dataObj.data === 'object') {
-          // Nested data object
-          if (dataObj.data.transaction) {
-            transactionData = dataObj.data as ModsecTransaction;
-          } else {
-            transactionData = { transaction: dataObj.data } as ModsecTransaction;
-          }
-        } else {
-          // Try using the whole object as transaction
-          transactionData = { transaction: dataObj } as ModsecTransaction;
-        }
-      } else {
-        throw new Error("Data is not an object");
-      }
-    } catch (error) {
-      console.error("Error parsing transaction data:", error);
-      console.error("Data structure:", JSON.stringify(landing.data, null, 2));
-      throw new Error(`Failed to parse transaction data: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
-    
-    // Validate that we have a transaction
-    if (!transactionData || !transactionData.transaction) {
-      throw new Error("Invalid transaction data structure - missing transaction");
-    }
-
-    // CRITICAL: Sanitize the entire transaction data structure before processing
-    // This ensures all escape sequences in nested fields (like response.body, 
-    // response.headers, messages[].details.match) are cleaned
-    const sanitizedTransaction = sanitizeJson(transactionData);
-    if (!sanitizedTransaction || !sanitizedTransaction.transaction) {
-      throw new Error("Failed to sanitize transaction data");
-    }
-
-    // Extract host from transaction to find matching organization
-    const host =
-      sanitizedTransaction.transaction.request.hostname ||
-      sanitizedTransaction.transaction.request.headers?.Host?.split(":")[0] ||
-      sanitizedTransaction.transaction.request.headers?.host?.split(":")[0] ||
-      "unknown";
-
-    // Find organization by matching host against domains array
-    // Use provided organizationId if available, otherwise lookup by host
-    let finalOrganizationId: string | undefined = organizationId;
-    if (!finalOrganizationId && host && host !== 'unknown') {
-      const foundOrgId = await findOrganizationByHost(host);
-      finalOrganizationId = foundOrgId || undefined;
-    }
-
-    // Transform to Log format using sanitized data and found organization ID
-    const logEntry = transformModsecToLog(sanitizedTransaction, finalOrganizationId);
-
-    // Final sanitization pass - ensure all fields are safe for PostgreSQL
-    // This is critical - Prisma will serialize JSONB fields, and any escape sequences
-    // in the data will cause PostgreSQL errors
-    let safeLogEntry: any;
-    try {
-      // Stringify and re-parse to ensure clean JSON structure
-      const stringified = JSON.stringify(logEntry);
-      const parsed = JSON.parse(stringified);
-      
-      safeLogEntry = {
-        ...parsed,
-        // Re-sanitize JSON fields - deep clean all nested strings
-        headers: parsed.headers ? sanitizeJson(parsed.headers) : null,
-        responseHeader: parsed.responseHeader ? sanitizeJson(parsed.responseHeader) : null,
-        // Re-sanitize all string fields
-        rule: parsed.rule ? sanitizeString(parsed.rule) : null,
-        ruleId: parsed.ruleId ? sanitizeString(parsed.ruleId) : null,
-        userAgent: parsed.userAgent ? sanitizeString(parsed.userAgent) : null,
-        message: parsed.message ? sanitizeString(parsed.message) : null,
-        // Ensure required fields
-        clientIp: parsed.clientIp || '0.0.0.0',
-        host: parsed.host || 'unknown',
-        method: parsed.method || 'GET',
-        requestUrl: parsed.requestUrl || '/',
-        action: parsed.action || 'warning',
-        severity: parsed.severity || 'LOW',
-      };
-    } catch (sanitizeError) {
-      console.error("Error during final sanitization:", sanitizeError);
-      console.error("Original logEntry:", JSON.stringify(logEntry, null, 2));
-      throw new Error(`Failed to sanitize log entry: ${sanitizeError instanceof Error ? sanitizeError.message : 'Unknown error'}`);
-    }
-
-    // Create Log entry with fully sanitized data
-    // Wrap in try-catch to get better error details
-    let log;
-    try {
-      log = await prisma.log.create({
-        data: safeLogEntry,
-      });
-    } catch (createError: any) {
-      // Log the problematic data for debugging
-      console.error("Failed to create log entry. Problematic data:");
-      console.error("Headers:", JSON.stringify(safeLogEntry.headers, null, 2));
-      console.error("ResponseHeader:", JSON.stringify(safeLogEntry.responseHeader, null, 2));
-      console.error("Rule:", safeLogEntry.rule);
-      console.error("Message:", safeLogEntry.message);
-      console.error("UserAgent:", safeLogEntry.userAgent);
-      console.error("Full entry (sanitized):", JSON.stringify(safeLogEntry, null, 2));
-      throw createError;
-    }
-
-    // Mark as processed using id
-    await prisma.modsecLanding.update({
-      where: {
-        id: id,
-      },
-      data: { processed: true },
-    });
-
-    return { success: true, logId: log.id };
+    const id = typeof landingId === "string" ? BigInt(landingId) : landingId;
+    const organizationIndex = organizationId
+      ? new Map<string, string | null>()
+      : await loadActiveOrganizationIndex();
+    return await processLockedLandingRecord(
+      id,
+      organizationId,
+      organizationIndex
+    );
   } catch (error) {
     console.error("Error processing modsec_landing record:", error);
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error",
-    };
+    return { success: false, error: errorMessage(error) };
+  }
+}
+
+async function mapWithConcurrency<T, R>(
+  values: T[],
+  concurrency: number,
+  task: (value: T) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let nextIndex = 0;
+
+  const worker = async () => {
+    while (true) {
+      const index = nextIndex++;
+      if (index >= values.length) return;
+      results[index] = await task(values[index]);
+    }
+  };
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(Math.max(1, concurrency), values.length) },
+      worker
+    )
+  );
+  return results;
+}
+
+async function fallbackClaimedRecords(
+  ids: bigint[],
+  organizationId: string | undefined,
+  organizationIndex: OrganizationDomainIndex
+): Promise<LandingBatchResult> {
+  const outcomes = await mapWithConcurrency(
+    ids,
+    FALLBACK_CONCURRENCY,
+    async (id) => {
+      try {
+        return await processLockedLandingRecord(
+          id,
+          organizationId,
+          organizationIndex
+        );
+      } catch (error) {
+        return { success: false, error: errorMessage(error) };
+      }
+    }
+  );
+
+  const errors: Array<{ id: string; error: string }> = [];
+  const logIds: string[] = [];
+  let processed = 0;
+
+  outcomes.forEach((outcome, index) => {
+    if (outcome.success) {
+      processed++;
+      if (outcome.logId) logIds.push(outcome.logId);
+      return;
+    }
+
+    // A concurrent worker may have committed after the failed bulk transaction
+    // released its locks. That row is complete, not a failure for this run.
+    if (outcome.error === "Record already processed") return;
+    errors.push({ id: ids[index].toString(), error: outcome.error ?? "Unknown error" });
+  });
+
+  return {
+    claimed: ids.length,
+    cursor: ids.at(-1) ?? null,
+    processed,
+    failed: errors.length,
+    errors,
+    logIds,
+  };
+}
+
+async function processClaimedBatch(
+  afterId: bigint,
+  throughId: bigint,
+  batchSize: number,
+  organizationId: string | undefined,
+  organizationIndex: OrganizationDomainIndex
+): Promise<LandingBatchResult> {
+  let claimedIds: bigint[] = [];
+
+  try {
+    return await prisma.$transaction(
+      async (tx) => {
+        const records = await tx.$queryRaw<ModsecLandingRecord[]>(Prisma.sql`
+          SELECT "id", "data", "processed"
+          FROM "modsec_landing"
+          WHERE "processed" = false
+            AND "id" > ${afterId}
+            AND "id" <= ${throughId}
+          ORDER BY "id" ASC
+          LIMIT ${batchSize}
+          FOR UPDATE SKIP LOCKED
+        `);
+        claimedIds = records.map((record) => record.id);
+        if (records.length === 0) {
+          return {
+            claimed: 0,
+            cursor: null,
+            processed: 0,
+            failed: 0,
+            errors: [],
+            logIds: [],
+          };
+        }
+
+        const prepared: PreparedLandingRecord[] = [];
+        const errors: Array<{ id: string; error: string }> = [];
+        for (const record of records) {
+          try {
+            prepared.push(
+              prepareLandingRecord(record, organizationId, organizationIndex)
+            );
+          } catch (error) {
+            errors.push({ id: record.id.toString(), error: errorMessage(error) });
+          }
+        }
+
+        let logIds: string[] = [];
+        if (prepared.length > 0) {
+          const created = await tx.log.createManyAndReturn({
+            data: prepared.map((item) => item.logData),
+            select: { id: true },
+          });
+          if (created.length !== prepared.length) {
+            throw new Error("Bulk insert returned an unexpected number of logs");
+          }
+
+          const updated = await tx.modsecLanding.updateMany({
+            where: {
+              id: { in: prepared.map((item) => item.landingId) },
+              processed: false,
+            },
+            data: { processed: true },
+          });
+          if (updated.count !== prepared.length) {
+            throw new Error("Bulk landing update count did not match log inserts");
+          }
+          logIds = created.map((log) => log.id);
+        }
+
+        return {
+          claimed: records.length,
+          cursor: records[records.length - 1].id,
+          processed: prepared.length,
+          failed: errors.length,
+          errors,
+          logIds,
+        };
+      },
+      {
+        maxWait: TRANSACTION_MAX_WAIT_MS,
+        timeout: BULK_TRANSACTION_TIMEOUT_MS,
+      }
+    );
+  } catch (bulkError) {
+    if (
+      claimedIds.length === 0 ||
+      !shouldRetryBulkRowsIndividually(bulkError)
+    ) {
+      throw bulkError;
+    }
+    console.warn(
+      `Bulk ModsecLanding batch failed; retrying ${claimedIds.length} rows individually:`,
+      errorMessage(bulkError)
+    );
+    return fallbackClaimedRecords(
+      claimedIds,
+      organizationId,
+      organizationIndex
+    );
   }
 }
 
 /**
- * Processes all unprocessed modsec_landing records
+ * Drain the pending landing table in monotonic keyset batches.
+ *
+ * Parse failures advance the in-run cursor but remain processed=false, so they
+ * are reported once per run and cannot starve later valid rows. A future run
+ * retries them after an operator fixes the malformed payload.
  */
 export async function processAllModsecLandingRecords(
   organizationId?: string,
@@ -518,51 +819,67 @@ export async function processAllModsecLandingRecords(
   processed: number;
   failed: number;
   errors: Array<{ id: string; error: string }>;
-  logIds: string[]; // Return log IDs that were created
+  logIds: string[];
 }> {
+  const size = normalizeLandingBatchSize(batchSize);
   const errors: Array<{ id: string; error: string }> = [];
   const logIds: string[] = [];
   let processed = 0;
   let failed = 0;
+  let cursor = 0n;
 
   try {
-    let skip = 0;
-    let hasMore = true;
+    // Bound this invocation to the backlog visible at start. Continuous
+    // ingestion is left for the next scheduled run, keeping notifications and
+    // accumulated result arrays finite under sustained traffic.
+    const pendingAtStart = await prisma.modsecLanding.aggregate({
+      where: { processed: false },
+      _max: { id: true },
+    });
+    const throughId = pendingAtStart._max.id;
+    if (throughId === null) {
+      return { processed, failed, errors, logIds };
+    }
+    const organizationIndex = organizationId
+      ? new Map<string, string | null>()
+      : await loadActiveOrganizationIndex();
 
-    while (hasMore) {
-      // Fetch unprocessed records in batches
-      const records = await prisma.modsecLanding.findMany({
-        where: { processed: false },
-        take: batchSize,
-        skip,
-        orderBy: { time: "asc" },
-      });
-
-      if (records.length === 0) {
-        hasMore = false;
-        break;
-      }
-
-      // Process each record
-      for (const record of records) {
-        const result = await processModsecLandingRecord(
-          record.id,
-          organizationId
+    while (true) {
+      let batch: LandingBatchResult;
+      try {
+        batch = await processClaimedBatch(
+          cursor,
+          throughId,
+          size,
+          organizationId,
+          organizationIndex
         );
-
-        if (result.success) {
-          processed++;
-          if (result.logId) {
-            logIds.push(result.logId);
-          }
-        } else {
+      } catch (error) {
+        // Earlier batches are already committed. Return their IDs so callers
+        // still deliver notifications, and record where the drain stopped so
+        // the next run can retry the untouched suffix.
+        if (processed > 0 || failed > 0 || logIds.length > 0) {
           failed++;
-          errors.push({ id: record.id.toString(), error: result.error || "Unknown error" });
+          errors.push({
+            id: `batch-after-${cursor.toString()}`,
+            error: `Processing stopped before the initial backlog was drained: ${errorMessage(error)}`,
+          });
+          console.error("ModsecLanding drain stopped after partial progress:", error);
+          return { processed, failed, errors, logIds };
         }
+        throw error;
       }
+      if (batch.claimed === 0 || batch.cursor === null) break;
 
-      skip += batchSize;
-      hasMore = records.length === batchSize;
+      processed += batch.processed;
+      failed += batch.failed;
+      errors.push(...batch.errors);
+      logIds.push(...batch.logIds);
+      cursor = batch.cursor;
+
+      // A short final page is the end of this keyset snapshot. Rows skipped
+      // because another worker holds their locks are owned by that worker.
+      if (batch.claimed < size) break;
     }
 
     return { processed, failed, errors, logIds };

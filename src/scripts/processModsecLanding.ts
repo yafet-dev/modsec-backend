@@ -35,7 +35,7 @@ async function main() {
     }
 
     // Process all records
-    const result = await processAllModsecLandingRecords(organizationId, 100);
+    const result = await processAllModsecLandingRecords(organizationId, 500);
 
     console.log("\n📈 Processing Results:");
     console.log(`   ✅ Successfully processed: ${result.processed}`);

@@ -15,11 +15,7 @@ import {
   type AttackOrigin,
   aggregateAttackOrigins,
 } from "../services/attackOrigins";
-import {
-  normalizeModsecHostname,
-  selectPendingLandingSummary,
-} from "../services/modsecLandingSummary";
-import { getCachedPendingLandingSnapshot } from "../services/modsecLandingStatus";
+import { normalizeModsecHostname } from "../utils/modsecHostname";
 import { modsecCronScheduler } from "../services/modsecCronScheduler";
 
 const router = Router();
@@ -938,17 +934,28 @@ router.get("/processing-status", async (req: Request, res: Response) => {
     let oldestPendingAt: Date | null = null;
     let checkedAt = new Date();
 
-    // A regular user without an active registered domain cannot own any raw
-    // landing record. Avoid scanning the global queue in that case.
+    // source_host is populated by the database trigger and covered by a
+    // processed=false partial index. This is one indexed count/minimum
+    // aggregate even when the historical landing table grows to millions.
     if (allowedHosts === null || allowedHosts.size > 0) {
-      const snapshot = await getCachedPendingLandingSnapshot();
-      const selected = selectPendingLandingSummary(snapshot, {
-        allowedHosts,
-        host: requestedHost,
+      const where: Prisma.ModsecLandingWhereInput = {
+        processed: false,
+      };
+
+      if (requestedHost) {
+        where.sourceHost = requestedHost;
+      } else if (allowedHosts !== null) {
+        where.sourceHost = { in: [...allowedHosts] };
+      }
+
+      const pending = await prisma.modsecLanding.aggregate({
+        where,
+        _count: { _all: true },
+        _min: { time: true },
       });
-      pendingCount = selected.pendingCount;
-      oldestPendingAt = selected.oldestPendingAt;
-      checkedAt = snapshot.checkedAt;
+      pendingCount = pending._count._all;
+      oldestPendingAt = pending._min.time;
+      checkedAt = new Date();
     }
 
     const schedulerStatus = modsecCronScheduler.getStatus();

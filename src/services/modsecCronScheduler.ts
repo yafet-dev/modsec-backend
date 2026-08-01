@@ -7,8 +7,8 @@ import { sendNotificationsForLogs, sendNotificationsForNewLogs } from "./notific
  * 
  * Environment variables:
  *   - ENABLE_MODSEC_CRON: Enable/disable cron (default: "true")
- *   - MODSEC_CRON_SCHEDULE: Cron schedule (default: every 5 minutes)
- *   - BATCH_SIZE: Number of records to process per run (default: 100)
+ *   - MODSEC_CRON_SCHEDULE: Cron schedule (default: every minute)
+ *   - BATCH_SIZE: Number of records claimed per transaction (default: 500)
  */
 class ModsecCronScheduler {
   private task: cron.ScheduledTask | null = null;
@@ -19,7 +19,7 @@ class ModsecCronScheduler {
    */
   start(): void {
     const enabled = process.env.ENABLE_MODSEC_CRON !== "false";
-    const schedule = process.env.MODSEC_CRON_SCHEDULE || "*/5 * * * *"; // Default: every 5 minutes
+    const schedule = process.env.MODSEC_CRON_SCHEDULE || "* * * * *";
 
     if (!enabled) {
       console.log("⏸️  ModSec cron scheduler is disabled (ENABLE_MODSEC_CRON=false)");
@@ -44,23 +44,10 @@ class ModsecCronScheduler {
       const startTime = Date.now();
 
       try {
-        const batchSize = parseInt(process.env.BATCH_SIZE || "100", 10);
+        const batchSize = parseInt(process.env.BATCH_SIZE || "500", 10);
 
         console.log(`🕐 [${new Date().toISOString()}] Starting ModSec processing cron job...`);
         console.log(`   Batch size: ${batchSize}`);
-
-        // Count unprocessed records
-        const { prisma } = await import("../lib/prisma");
-        const unprocessedCount = await prisma.modsecLanding.count({
-          where: { processed: false },
-        });
-
-        if (unprocessedCount === 0) {
-          console.log("   ✅ No records to process");
-          return;
-        }
-
-        console.log(`   📊 Found ${unprocessedCount} unprocessed records`);
 
         // Process records (organization ID will be automatically matched by host domain)
         const result = await processAllModsecLandingRecords(
@@ -69,6 +56,11 @@ class ModsecCronScheduler {
         );
 
         const duration = Date.now() - startTime;
+        if (result.processed === 0 && result.failed === 0) {
+          console.log("   ✅ No records to process");
+          return;
+        }
+
         console.log(`   ✅ Successfully processed: ${result.processed}`);
         console.log(`   ❌ Failed: ${result.failed}`);
         console.log(`   ⏱️  Duration: ${duration}ms`);

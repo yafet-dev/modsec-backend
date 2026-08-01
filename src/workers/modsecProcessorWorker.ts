@@ -1,15 +1,12 @@
 import { prisma } from "../lib/prisma";
-import {
-  processAllModsecLandingRecords,
-  processModsecLandingRecord,
-} from "../services/modsecProcessor";
+import { processAllModsecLandingRecords } from "../services/modsecProcessor";
 
 /**
  * Worker process that runs continuously and processes modsec_landing records
  * Run this as a separate process: npm run worker:modsec
  */
 async function worker() {
-  const BATCH_SIZE = 50;
+  const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || "500", 10);
   const POLL_INTERVAL = 5000; // 5 seconds
   const ORGANIZATION_ID = process.env.DEFAULT_ORGANIZATION_ID;
 
@@ -20,24 +17,17 @@ async function worker() {
 
   while (true) {
     try {
-      // Check for unprocessed records
-      const unprocessedCount = await prisma.modsecLanding.count({
-        where: { processed: false },
-      });
-
-      if (unprocessedCount === 0) {
-        // No records to process, wait and check again
-        await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
-        continue;
-      }
-
-      console.log(`\n📊 Found ${unprocessedCount} unprocessed records`);
-
-      // Process a batch
+      // The keyset claimer already returns immediately when the queue is
+      // empty, avoiding a separate full COUNT scan before every worker poll.
       const result = await processAllModsecLandingRecords(
         ORGANIZATION_ID,
         BATCH_SIZE
       );
+
+      if (result.processed === 0 && result.failed === 0) {
+        await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
+        continue;
+      }
 
       console.log(`   ✅ Processed: ${result.processed}`);
       console.log(`   ❌ Failed: ${result.failed}`);

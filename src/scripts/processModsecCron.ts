@@ -1,44 +1,35 @@
-import { PrismaClient } from "@prisma/client";
+import { prisma } from "../lib/prisma";
 import { processAllModsecLandingRecords } from "../services/modsecProcessor";
 import { sendNotificationsForLogs, sendNotificationsForNewLogs } from "../services/notificationService";
-
-const prisma = new PrismaClient();
 
 /**
  * Cron job script to process modsec_landing records
  * 
  * Usage:
- *   - Add to crontab: Every 5 minutes: cd /path/to/project && npm run cron:modsec
+ *   - Add to crontab: Every minute: cd /path/to/project && npm run cron:modsec
  *   - Or use node-cron in Node.js
  *   - Or use systemd timer
  * 
  * Environment variables:
- *   - BATCH_SIZE (default: 100)
+ *   - BATCH_SIZE (default: 500)
  */
 async function main() {
-  const batchSize = parseInt(process.env.BATCH_SIZE || "100", 10);
+  const batchSize = parseInt(process.env.BATCH_SIZE || "500", 10);
 
   console.log(`🕐 [${new Date().toISOString()}] Starting ModSec processing cron job...`);
   console.log(`   Batch size: ${batchSize}`);
 
   try {
-    // Count unprocessed records
-    const unprocessedCount = await prisma.modsecLanding.count({
-      where: { processed: false },
-    });
-
-    if (unprocessedCount === 0) {
-      console.log("   ✅ No records to process");
-      return;
-    }
-
-    console.log(`   📊 Found ${unprocessedCount} unprocessed records`);
-
     // Process records (organization ID will be automatically matched by host domain)
     const result = await processAllModsecLandingRecords(
       undefined,
       batchSize
     );
+
+    if (result.processed === 0 && result.failed === 0) {
+      console.log("   ✅ No records to process");
+      return;
+    }
 
     console.log(`   ✅ Successfully processed: ${result.processed}`);
     console.log(`   ❌ Failed: ${result.failed}`);
