@@ -20,6 +20,8 @@ import { telegramWebhookRouter, telegramApiRouter } from "./routes/telegram.rout
 import { modsecCronScheduler } from "./services/modsecCronScheduler";
 import { startSummaryReportCron, stopSummaryReportCron } from "./services/summaryReportCron";
 import { summaryReportRoutes } from "./routes/summary-report.routes";
+import { dataRetentionRoutes } from "./routes/data-retention.routes";
+import { startDataRetentionCron, stopDataRetentionCron } from "./services/dataRetentionCron";
 
 const app: Express = express();
 const PORT = process.env.PORT || 3001;
@@ -377,6 +379,7 @@ app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/organizations", organizationRoutes);
 app.use("/api/organizations", summaryReportRoutes);
+app.use("/api/organizations", dataRetentionRoutes);
 app.use("/api/organizations", domainWafRoutes);
 app.use("/api/organizations", ipBanRoutes);
 app.use("/api/organizations", geoAccessRoutes);
@@ -423,6 +426,7 @@ app.listen(PORT, () => {
   // Start ModSec cron scheduler
   modsecCronScheduler.start();
   startSummaryReportCron();
+  startDataRetentionCron();
 });
 
 // Graceful shutdown
@@ -430,6 +434,7 @@ process.on("SIGTERM", () => {
   console.log("SIGTERM received, shutting down gracefully...");
   modsecCronScheduler.stop();
   stopSummaryReportCron();
+  stopDataRetentionCron();
   process.exit(0);
 });
 
@@ -437,6 +442,7 @@ process.on("SIGINT", () => {
   console.log("SIGINT received, shutting down gracefully...");
   modsecCronScheduler.stop();
   stopSummaryReportCron();
+  stopDataRetentionCron();
   process.exit(0);
 });
 

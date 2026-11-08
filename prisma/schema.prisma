@@ -56,23 +56,32 @@ model OrganizationMember {
 }
 
 model Organization {
-  id                     String                 @id @default(uuid())
-  name                   String
-  domains                String[]
-  ownerEmail             String?
-  status                 String                 @default("pending")
+  id                       String                 @id @default(uuid())
+  name                     String
+  domains                  String[]
+  ownerEmail               String?
+  status                   String                 @default("pending")
   /// Periodic WAF summary emails: daily | weekly | monthly | hourly
-  summaryReportFrequency String                 @default("daily")
-  summaryReportEnabled   Boolean                @default(false)
-  summaryReportEmails    String[]               @default([])
-  createdAt              DateTime               @default(now())
-  updatedAt              DateTime               @updatedAt
-  logs                   Log[]
-  members                OrganizationMember[]
-  domainWafStatuses      DomainWAFStatus[]
-  ipBans                 IPBan[]
-  geoAccessControls      GeoAccessControl[]
-  notificationSettings   NotificationSettings[]
+  summaryReportFrequency   String                 @default("daily")
+  summaryReportEnabled     Boolean                @default(false)
+  summaryReportEmails      String[]               @default([])
+  /// Days to keep organized WAF logs (Log rows). 7-365, default 30.
+  /// Above 90 days the UI requires the admin to acknowledge a database sizing warning.
+  logRetentionDays         Int                    @default(30)
+  /// Days to keep raw, unorganized ModSecurity JSON (modsec_landing rows). 7-90, default 30.
+  rawRetentionDays         Int                    @default(30)
+  /// Result of the most recent data retention cleanup for this organization.
+  retentionLastRunAt       DateTime?
+  retentionLastLogsDeleted Int                    @default(0)
+  retentionLastRawDeleted  Int                    @default(0)
+  createdAt                DateTime               @default(now())
+  updatedAt                DateTime               @updatedAt
+  logs                     Log[]
+  members                  OrganizationMember[]
+  domainWafStatuses        DomainWAFStatus[]
+  ipBans                   IPBan[]
+  geoAccessControls        GeoAccessControl[]
+  notificationSettings     NotificationSettings[]
 }
 
 model Log {
